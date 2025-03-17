@@ -1,13 +1,11 @@
 from typing import Dict
-
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-
 from models.enums import DataType
 from models.field_metadata import FieldMetadata
-
+from data_generation.tools import rescale_numeric_values, convert_categorical_values
 
 class Generator(nn.Module):
     def __init__(self, input_dim, output_dim, cat_dims):
@@ -54,9 +52,13 @@ def generate_synthetic_data_gan(df: pd.DataFrame, metadata: Dict[str, FieldMetad
     # Generate synthetic numeric + categorical data
     z = torch.randn(synthetic_size, input_dim)
     num_data, cat_data = generator(z)
+    # Convert from tensor to NumPy
+    #num_data = num_data.detach().numpy()
+    # Convert each tensor in the list
+    #cat_data = [t.detach().numpy() for t in cat_data]
 
     # Rescale numeric values
-    num_df = rescale_numeric_values(df, numerical_cols, numerical_cols, metadata)
+    num_df = rescale_numeric_values(df, num_data, numerical_cols, metadata)
 
     # Convert categorical values
     cat_df = convert_categorical_values(df, cat_data, categorical_cols)
@@ -64,22 +66,3 @@ def generate_synthetic_data_gan(df: pd.DataFrame, metadata: Dict[str, FieldMetad
     return pd.concat([num_df, cat_df], axis=1)
 
 
-def rescale_numeric_values(df, num_data, numerical_cols, metadata):
-    num_df = pd.DataFrame(num_data.detach().numpy(), columns=numerical_cols)
-
-    for col in numerical_cols:
-        min_val, max_val = df[col].min(), df[col].max()
-        num_df[col] = num_df[col] * (max_val - min_val) + min_val
-        if metadata[col].data_type == DataType.INTEGER:
-            num_df[col] = num_df[col].round().astype(int)
-
-    return num_df
-
-
-def convert_categorical_values(df, cat_data, categorical_cols):
-    cat_df = pd.DataFrame({col: torch.argmax(cat_data[i], dim=1).numpy() for i, col in enumerate(categorical_cols)})
-
-    for col in categorical_cols:
-        cat_df[col] = df[col].unique()[cat_df[col]]  # Convert indices back to category names
-
-    return cat_df

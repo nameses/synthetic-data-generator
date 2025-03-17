@@ -19,7 +19,7 @@ def generate_synthetic_data(df: pd.DataFrame,
     if method_type == MethodType.GAN:
         return generate_synthetic_data_gan(df, metadata, synthetic_size)
     elif method_type == MethodType.VAE:
-        return generate_synthetic_data_vae(df, input_dim, synthetic_size)
+        return generate_synthetic_data_vae(df, metadata, synthetic_size)
     else:
         raise ValueError("Unsupported method type")
 
