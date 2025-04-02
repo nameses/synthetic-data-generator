@@ -7,6 +7,7 @@ from models.enums import DataType
 from models.field_metadata import FieldMetadata
 from data_generation.tools import rescale_numeric_values, convert_categorical_values
 
+
 class Generator(nn.Module):
     def __init__(self, input_dim, output_dim, cat_dims):
         super(Generator, self).__init__()
@@ -14,6 +15,7 @@ class Generator(nn.Module):
             nn.Linear(input_dim, 128),
             nn.ReLU()
         )
+
         self.num_output = nn.Linear(128, output_dim)  # For numeric data
         self.cat_outputs = nn.ModuleList([nn.Linear(128, dim) for dim in cat_dims])  # For categorical data
 
@@ -53,9 +55,9 @@ def generate_synthetic_data_gan(df: pd.DataFrame, metadata: Dict[str, FieldMetad
     z = torch.randn(synthetic_size, input_dim)
     num_data, cat_data = generator(z)
     # Convert from tensor to NumPy
-    #num_data = num_data.detach().numpy()
+    # num_data = num_data.detach().numpy()
     # Convert each tensor in the list
-    #cat_data = [t.detach().numpy() for t in cat_data]
+    # cat_data = [t.detach().numpy() for t in cat_data]
 
     # Rescale numeric values
     num_df = rescale_numeric_values(df, num_data, numerical_cols, metadata)
@@ -64,5 +66,3 @@ def generate_synthetic_data_gan(df: pd.DataFrame, metadata: Dict[str, FieldMetad
     cat_df = convert_categorical_values(df, cat_data, categorical_cols)
 
     return pd.concat([num_df, cat_df], axis=1)
-
-

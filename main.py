@@ -1,69 +1,83 @@
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from sklearn.decomposition import PCA
-from scipy.stats import ks_2samp, entropy
-from enum import Enum
-from typing import Dict, Any
+from datetime import datetime
 from faker import Faker
+from typing import Dict
 
+from analytics.report_generator import generate_comparison_report
 from data_generation.api import generate_synthetic_data
 from models.enums import DataType, MethodType
 from models.field_metadata import FieldMetadata
 
 fake = Faker()
 
-def mix_real_synthetic(real: pd.DataFrame, synthetic: pd.DataFrame, mix_ratio=0.5) -> pd.DataFrame:
-    mix_size = int(len(real) * mix_ratio)
-    mixed_data = pd.concat([real.sample(mix_size), synthetic.sample(mix_size)], ignore_index=True)
-    return mixed_data
+
+def load_real_datasets():
+    """Load larger real datasets from public sources"""
+    try:
+        # Example with larger dataset (adjust as needed)
+        import seaborn as sns
+        data = sns.load_dataset('diamonds').head(40000)
+
+        # Add some synthetic fields for demonstration
+        fake = Faker()
+        data['purchase_date'] = pd.to_datetime('2020-01-01') + pd.to_timedelta(
+            np.random.randint(0, 365 * 3, len(data)), unit='d'
+        )
+        data['customer_email'] = [fake.email() for _ in range(len(data))]
+        data['is_premium'] = data['price'] > data['price'].quantile(0.8)
+
+        return data
+
+    except Exception as e:
+        print(f"Error loading dataset: {e}")
+        # Fallback to titanic dataset
+        titanic_url = "https://raw.githubusercontent.com/mwaskom/seaborn-data/master/titanic.csv"
+        return pd.read_csv(titanic_url)
+
+# Define metadata with configurable string generation
+def get_metadata() -> Dict[str, FieldMetadata]:
+    """Example for diamonds dataset - adjust according to your actual dataset"""
+    return {
+        'carat': FieldMetadata(DataType.DECIMAL, min_value=0.2, max_value=5.01),
+        'cut': FieldMetadata(DataType.CATEGORICAL),
+        'color': FieldMetadata(DataType.CATEGORICAL),
+        'clarity': FieldMetadata(DataType.CATEGORICAL),
+        'depth': FieldMetadata(DataType.DECIMAL, min_value=43, max_value=79),
+        'table': FieldMetadata(DataType.DECIMAL, min_value=43, max_value=95),
+        'price': FieldMetadata(DataType.INTEGER),
+        'x': FieldMetadata(DataType.DECIMAL),
+        'y': FieldMetadata(DataType.DECIMAL),
+        'z': FieldMetadata(DataType.DECIMAL),
+        'purchase_date': FieldMetadata(DataType.DATE_TIME),
+        'customer_email': FieldMetadata(DataType.STRING, fake_strategy='email'),
+        'is_premium': FieldMetadata(DataType.BOOLEAN)
+    }
 
 
-def compare_datasets(real: pd.DataFrame, synthetic: pd.DataFrame):
-    stats = {}
-    for column in real.columns:
-        if real[column].dtype in [np.int64, np.float64]:
-            stats[column] = {
-                "KS_test": ks_2samp(real[column], synthetic[column]).statistic,
-                "Mean_diff": abs(real[column].mean() - synthetic[column].mean()),
-                "Std_diff": abs(real[column].std() - synthetic[column].std()),
-            }
-        elif real[column].dtype == object:
-            stats[column] = {
-                "JSD": entropy(pd.value_counts(real[column], normalize=True),
-                               pd.value_counts(synthetic[column], normalize=True))
-            }
-    return stats
+# Update the main execution part
+if __name__ == "__main__":
+    # Load real data
+    real_data = load_real_datasets()
+    print("Loaded real data with shape:", real_data.shape)
 
- 
-def visualize_data(real: pd.DataFrame, synthetic: pd.DataFrame):
-    pca = PCA(n_components=2)
-    real_pca = pca.fit_transform(real.select_dtypes(include=[np.number]))
-    synth_pca = pca.transform(synthetic.select_dtypes(include=[np.number]))
+    metadata = get_metadata()
 
-    plt.scatter(real_pca[:, 0], real_pca[:, 1], label='Real', alpha=0.5)
-    plt.scatter(synth_pca[:, 0], synth_pca[:, 1], label='Synthetic', alpha=0.5)
-    plt.legend()
-    plt.title("PCA Projection of Real vs Synthetic Data")
-    plt.show()
+    # Generate synthetic data at 50% size of original
+    synthetic_size = int(len(real_data) * 0.2)
 
+    print(f"Generating synthetic data at 5% size: {synthetic_size} samples")
 
-metadataExample = {
-    "age": FieldMetadata(DataType.INTEGER),
-    "salary": FieldMetadata(DataType.DECIMAL),
-    "gender": FieldMetadata(DataType.CATEGORICAL),
-    "name": FieldMetadata(DataType.STRING, faker_func=fake.name)
-}
-size = 10000
-real_data = pd.DataFrame({
-    "age": np.random.randint(18, 60, size),
-    "salary": np.random.uniform(30000, 100000, size),
-    "gender": np.random.choice(["Male", "Female"], size),
-    "name": [fake.name() for _ in range(10000)]
-})
-synthetic_data = generate_synthetic_data(real_data, metadataExample, MethodType.GAN, size)
-print(real_data)
-print(synthetic_data)
-#mixed_data = mix_real_synthetic(real_data, synthetic_data)
-#stats = compare_datasets(real_data, synthetic_data)
-visualize_data(real_data, synthetic_data)
+    synthetic_data = generate_synthetic_data(
+        real_data,
+        metadata,
+        MethodType.WGAN,
+        synthetic_size=synthetic_size
+    )
+
+    # Generate comparison report
+    generate_comparison_report(
+        real_data,
+        synthetic_data,
+        metadata
+    )
