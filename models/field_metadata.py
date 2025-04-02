@@ -1,4 +1,4 @@
-from typing import Dict, Any, Optional, Callable
+from typing import Dict, Any, Optional, Callable, List
 from faker import Faker
 
 from models.enums import DataType
@@ -12,6 +12,7 @@ class FieldMetadata:
             # For numerical fields
             min_value: Optional[float] = None,
             max_value: Optional[float] = None,
+            constraints: Optional[List[Dict]] = None,
 
             # For string fields
             fake_strategy: Optional[str] = None,
@@ -19,37 +20,40 @@ class FieldMetadata:
             string_format: Optional[str] = None
     ):
         self.data_type = data_type
+        self.min_value = min_value
+        self.max_value = max_value
+        self.constraints = constraints or []
+        self.fake_strategy = fake_strategy
+        self.custom_faker = custom_faker
+        self.string_format = string_format
 
-        # Numerical fields
-        if data_type in [DataType.INTEGER, DataType.DECIMAL]:
-            self.min_value = min_value
-            self.max_value = max_value
+        self._validate_config()
 
-        # String fields
-        elif data_type == DataType.STRING:
-            self.fake_strategy = fake_strategy
-            self.custom_faker = custom_faker
-            self.string_format = string_format
-            self._validate_string_config()
+    def _validate_config(self):
+        """Validate field configuration"""
+        if self.data_type in [DataType.INTEGER, DataType.DECIMAL]:
+            if self.min_value is not None and self.max_value is not None:
+                if self.min_value > self.max_value:
+                    raise ValueError(
+                        f"min_value ({self.min_value}) cannot be greater than max_value ({self.max_value})")
 
-    def _validate_string_config(self):
-        if self.custom_faker and (self.fake_strategy or self.string_format):
-            raise ValueError("Cannot specify both custom_faker and fake_strategy/string_format")
+        if self.data_type == DataType.STRING:
+            if self.custom_faker and (self.fake_strategy or self.string_format):
+                raise ValueError("Cannot specify both custom_faker and fake_strategy/string_format")
 
-        if self.fake_strategy and self.fake_strategy not in dir(Faker()):
-            raise ValueError(f"Invalid fake strategy: {self.fake_strategy}")
+            if self.fake_strategy:
+                fake = Faker()
+                if self.fake_strategy not in dir(fake):
+                    raise ValueError(f"Invalid fake strategy: {self.fake_strategy}")
 
-    def get_string_generator(self) -> Callable:
-        """Returns a function that generates synthetic strings"""
-        fake = Faker()
+    def add_constraint(self, constraint_type: str, other_column: str, **kwargs):
+        """Add a relational constraint to this field"""
+        valid_types = ['greater_than', 'less_than', 'positive_correlation']
+        if constraint_type not in valid_types:
+            raise ValueError(f"Invalid constraint type. Must be one of: {valid_types}")
 
-        if self.custom_faker:
-            return self.custom_faker
-
-        if self.fake_strategy:
-            if self.string_format:
-                return lambda: getattr(fake, self.fake_strategy)(self.string_format)
-            return getattr(fake, self.fake_strategy)
-
-        # Default string generation
-        return fake.text
+        self.constraints.append({
+            'type': constraint_type,
+            'other_column': other_column,
+            **kwargs
+        })
