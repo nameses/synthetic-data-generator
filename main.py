@@ -12,6 +12,10 @@ from data_generation.wgan import GANConfig
 from models.enums import DataType, MethodType
 from models.field_metadata import FieldMetadata
 
+# 5 int, 5 cat - https://www.kaggle.com/datasets/uciml/german-credit/data
+# 7 int, 12 cat, 2 bool - https://www.kaggle.com/datasets/elsnkazm/german-credit-scoring-data
+# 1 date, 1 time, !!id!! - https://www.kaggle.com/datasets/usgs/earthquake-database
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -33,7 +37,7 @@ class DataGenerator:
         logger.info("Using demo diamond dataset")
         try:
             import seaborn as sns
-            data = sns.load_dataset('diamonds').head(40000)
+            data = sns.load_dataset('diamonds').head(30000)
 
             # Add synthetic fields for demonstration
             data['purchase_date'] = pd.to_datetime('2020-01-01') + pd.to_timedelta(
@@ -51,43 +55,54 @@ class DataGenerator:
     def define_metadata(self, data: pd.DataFrame) -> Dict[str, FieldMetadata]:
         """Define metadata with physics constraints"""
         metadata = {
-            'carat': FieldMetadata(
+            'person_age': FieldMetadata(
+                DataType.INTEGER,
+                min_value=18,
+                max_value=100
+            ),
+            'person_income': FieldMetadata(
+                DataType.INTEGER,
+                min_value=0,
+                max_value=1000000
+            ),
+            'person_home_ownership': FieldMetadata(
+                DataType.CATEGORICAL
+            ),
+            'person_emp_length': FieldMetadata(
                 DataType.DECIMAL,
-                min_value=0.2,
-                max_value=5.01,
-                constraints=[
-                    {'type': 'positive_correlation', 'other_column': 'price', 'min_ratio': 1000}
-                ]
+                min_value=0,
+                max_value=50  # More realistic max
             ),
-            'cut': FieldMetadata(DataType.CATEGORICAL),
-            'color': FieldMetadata(DataType.CATEGORICAL),
-            'clarity': FieldMetadata(DataType.CATEGORICAL),
-            'depth': FieldMetadata(
+            'loan_intent': FieldMetadata(DataType.CATEGORICAL),
+            'loan_grade': FieldMetadata(
+                DataType.CATEGORICAL
+            ),
+            'loan_amnt': FieldMetadata(
+                DataType.INTEGER,
+                min_value=500,
+                max_value=35000
+            ),
+            'loan_int_rate': FieldMetadata(
                 DataType.DECIMAL,
-                min_value=43,
-                max_value=79
+                min_value=5.0,
+                max_value=30.0
             ),
-            'table': FieldMetadata(
+            'loan_status': FieldMetadata(
+                DataType.BOOLEAN
+            ),
+            'loan_percent_income': FieldMetadata(
                 DataType.DECIMAL,
-                min_value=43,
-                max_value=95
+                min_value=0.0,
+                max_value=1.0
             ),
-            'price': FieldMetadata(DataType.INTEGER),
-            'x': FieldMetadata(
-                DataType.DECIMAL,
-                constraints=[{'type': 'greater_than', 'other_column': 'y'}]
+            'cb_person_default_on_file': FieldMetadata(
+                DataType.CATEGORICAL
             ),
-            'y': FieldMetadata(
-                DataType.DECIMAL,
-                constraints=[{'type': 'greater_than', 'other_column': 'z'}]
-            ),
-            'z': FieldMetadata(DataType.DECIMAL),
-            'purchase_date': FieldMetadata(DataType.DATE_TIME),
-            'customer_email': FieldMetadata(
-                DataType.STRING,
-                fake_strategy='email'
-            ),
-            'is_premium': FieldMetadata(DataType.BOOLEAN)
+            'cb_person_cred_hist_length': FieldMetadata(
+                DataType.INTEGER,
+                min_value=0,
+                max_value=30
+            )
         }
 
         # Only keep columns that exist in the data
@@ -99,34 +114,19 @@ class DataGenerator:
             metadata: Dict[str, FieldMetadata],
             method: MethodType = MethodType.WGAN,
             synthetic_size: Optional[int] = None,
-            epochs: int = 100
+            epochs: int = 10
     ) -> pd.DataFrame:
         """Generate synthetic data using specified method"""
-        synthetic_size = synthetic_size or len(real_data) // 5  # Default 20% size
+        synthetic_size = synthetic_size or len(real_data) // 5
 
         logger.info(f"Generating {synthetic_size} synthetic samples using {method.value}")
 
         if method == MethodType.WGAN:
-            from data_generation.wgan import PhysicsInformedWGAN
+            from data_generation.wgan import WGAN
 
-            gan_config = GANConfig(
-                latent_dim=512,
-                batch_size=256,
-                n_critic=5,
-                gp_weight=10.0,
-                phys_weight=1.0,
-                g_lr=1e-4,
-                d_lr=1e-4,
-                g_betas=(0.5, 0.9),
-                d_betas=(0.5, 0.9),
-                patience=25,
-                clip_value=0.5,
-                use_mixed_precision=True,
-                spectral_norm=True,
-                residual_blocks=True
-            )
+            gan_config = GANConfig()
 
-            generator = PhysicsInformedWGAN(
+            generator = WGAN(
                 real_data=real_data,
                 metadata=metadata,
                 config=gan_config
@@ -194,7 +194,9 @@ def main():
         generator = DataGenerator()
 
         # 1. Load real data
-        real_data = generator.load_real_data()  # Or pass path to your data
+        real_data = generator.load_real_data('datasets/credit_risk_dataset.csv')
+        real_data = real_data.dropna()
+
         logger.info(f"Loaded real data with shape: {real_data.shape}")
 
         # 2. Define metadata with constraints
@@ -205,9 +207,7 @@ def main():
         synthetic_data = generator.generate_synthetic_data(
             real_data=real_data,
             metadata=metadata,
-            method=MethodType.WGAN,
-            synthetic_size=10000,
-            epochs=100
+            method=MethodType.WGAN
         )
         logger.info(f"Generated synthetic data with shape: {synthetic_data.shape}")
 
@@ -221,11 +221,6 @@ def main():
             metadata=metadata
         )
         logger.info(f"Generated comparison report at: {report_path}")
-
-        # 6. Save synthetic data
-        output_path = "synthetic_data.csv"
-        synthetic_data.to_csv(output_path, index=False)
-        logger.info(f"Saved synthetic data to: {output_path}")
 
     except Exception as e:
         logger.error(f"Error in data generation pipeline: {str(e)}", exc_info=True)

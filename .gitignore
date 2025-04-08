@@ -1,3 +1,7 @@
 .idea
 __pycache__
 */__pycache__
+wgan_checkpoints/
+reports/
+datasets/
+checkpoints/
