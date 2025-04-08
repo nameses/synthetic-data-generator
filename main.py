@@ -71,7 +71,7 @@ class DataGenerator:
             'person_emp_length': FieldMetadata(
                 DataType.DECIMAL,
                 min_value=0,
-                max_value=50  # More realistic max
+                max_value=50
             ),
             'loan_intent': FieldMetadata(DataType.CATEGORICAL),
             'loan_grade': FieldMetadata(

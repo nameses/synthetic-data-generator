@@ -35,7 +35,6 @@ class GANConfig:
             batch_size: int = 128,
             n_critic: int = 1,
             gp_weight: float = 10.0,
-            phys_weight: float = 0.1,
             g_lr: float = 1e-4,
             d_lr: float = 1e-4,
             g_betas: tuple = (0.5, 0.9),
@@ -52,14 +51,11 @@ class GANConfig:
             max_epochs: int = 500,
             scheduler_type: str = 'cosine',
             normalization_method: str = 'power',
-            constraint_relaxation: float = 0.9,
-            progressive_training: bool = True,
     ):
         self.latent_dim = latent_dim
         self.batch_size = batch_size
         self.n_critic = n_critic
         self.gp_weight = gp_weight
-        self.phys_weight = phys_weight
         self.g_lr = g_lr
         self.d_lr = d_lr
         self.g_betas = g_betas
@@ -69,7 +65,6 @@ class GANConfig:
         self.use_mixed_precision = use_mixed_precision
         self.spectral_norm = spectral_norm
         self.residual_blocks = residual_blocks
-        self.progressive_training = progressive_training
         self.noise_level = noise_level
         self.minibatch_std = minibatch_std
         self.feature_matching = feature_matching
@@ -77,7 +72,6 @@ class GANConfig:
         self.max_epochs = max_epochs
         self.scheduler_type = scheduler_type
         self.normalization_method = normalization_method
-        self.constraint_relaxation = constraint_relaxation
 
 
 def apply_spectral_norm(module, apply_spectral_norm=True):
@@ -304,7 +298,7 @@ class WGAN:
         self.config = config
         self.faker = Faker()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.history = {'g_loss': [], 'd_loss': [], 'grad_norms': [], 'phys_loss': []}
+        self.history = {'g_loss': [], 'd_loss': [], 'grad_norms': []}
 
         # Enable anomaly detection during development
         # torch.autograd.set_detect_anomaly(True)
@@ -393,21 +387,6 @@ class WGAN:
         dataset = TensorDataset(self.X_num, self.X_cat) if self.X_cat is not None else TensorDataset(self.X_num)
         self.loader = DataLoader(dataset, batch_size=self.config.batch_size, shuffle=True, drop_last=True)
 
-        # Calculate mean and std for each numerical column to use in physics constraints
-        self.column_stats = {}
-        for i, col in enumerate(self.numerical_cols):
-            if self.num_numerical > 0:
-                col_data = self.X_num[:, i].numpy()
-                self.column_stats[col] = {
-                    'mean': float(np.mean(col_data)),
-                    'std': float(np.std(col_data)),
-                    'min': float(np.min(col_data)),
-                    'max': float(np.max(col_data)),
-                    'median': float(np.median(col_data)),
-                    'q1': float(np.percentile(col_data, 25)),
-                    'q3': float(np.percentile(col_data, 75))
-                }
-
         logger.info(
             f"Preprocessed data with {self.num_numerical} numerical features and {self.num_categorical} categorical features")
 
@@ -479,193 +458,6 @@ class WGAN:
             logger.info(f"{name}: requires_grad={param.requires_grad}")
 
         logger.info(f"Models initialized on {self.device}")
-
-    def apply_physics_constraints(self, synthetic):
-        """Apply constraints without any inplace operations"""
-        # Start with a clone to avoid inplace operations
-        result = synthetic.clone()
-
-        # Create a dictionary for easier reference
-        synthetic_dict = {col: result[:, i].clone() for i, col in enumerate(self.numerical_cols)}
-
-        # Apply constraints column by column with debugging
-        for i, col in enumerate(self.numerical_cols):
-            if col not in self.num_ranges:
-                continue
-
-            min_val, max_val = self.num_ranges[col]
-            col_data = result[:, i]
-
-            # Debug before applying constraints
-            if torch.isnan(col_data).any():
-                logger.warning(f"NaN detected in {col} before constraints")
-
-            # Soft constraints with gradient flow
-            if min_val is not None:
-                result[:, i] = col_data + F.softplus(min_val - col_data, beta=1)
-            if max_val is not None:
-                result[:, i] = col_data - F.softplus(col_data - max_val, beta=1)
-
-            # Debug after applying constraints
-            if torch.isnan(result[:, i]).any():
-                logger.warning(f"NaN detected in {col} after constraints")
-
-        # Apply relational constraints
-        for col, meta in self.metadata.items():
-            if col not in self.numerical_cols:
-                continue
-
-            col_idx = self.numerical_cols.index(col)
-
-            # Process each constraint defined in metadata
-            for constraint in getattr(meta, 'constraints', []):
-                other_col = constraint.get('other_column')
-                if other_col not in synthetic_dict:
-                    continue
-
-                other_idx = self.numerical_cols.index(other_col)
-
-                if constraint['type'] == 'greater_than':
-                    margin = constraint.get('margin', 0.0)
-                    # Get the current values
-                    current_val = synthetic_dict[col]
-                    other_val = synthetic_dict[other_col]
-
-                    # Calculate violation amount
-                    violation = F.relu(other_val - current_val + margin)
-
-                    # Apply correction with gradual adjustment to avoid sharp changes
-                    adjustment = violation * 0.9  # Apply 90% of the needed adjustment
-                    corrected = current_val + adjustment
-
-                    # Update tensors
-                    result[:, col_idx] = corrected
-                    synthetic_dict[col] = corrected
-
-                # Handle less_than constraint
-                elif constraint['type'] == 'less_than':
-                    margin = constraint.get('margin', 0.0)
-                    # Get the current values
-                    current_val = synthetic_dict[col]
-                    other_val = synthetic_dict[other_col]
-
-                    # Calculate violation amount
-                    violation = F.relu(current_val - other_val + margin)
-
-                    # Apply correction with gradual adjustment
-                    adjustment = violation * 0.9  # Apply 90% of the needed adjustment
-                    corrected = current_val - adjustment
-
-                    # Update tensors
-                    result[:, col_idx] = corrected
-                    synthetic_dict[col] = corrected
-
-                # Handle min_ratio constraint
-                elif constraint['type'] == 'min_ratio':
-                    ratio = constraint.get('ratio', 1.0)
-                    # Ensure col >= other_col * ratio
-                    current_val = synthetic_dict[col]
-                    other_val = synthetic_dict[other_col]
-
-                    # Target minimum value
-                    min_target = other_val * ratio
-
-                    # Calculate violation
-                    violation = F.relu(min_target - current_val)
-
-                    # Apply correction
-                    corrected = current_val + violation
-
-                    # Update tensors
-                    result[:, col_idx] = corrected
-                    synthetic_dict[col] = corrected
-
-                # Handle max_ratio constraint
-                elif constraint['type'] == 'max_ratio':
-                    ratio = constraint.get('ratio', 1.0)
-                    # Ensure col <= other_col * ratio
-                    current_val = synthetic_dict[col]
-                    other_val = synthetic_dict[other_col]
-
-                    # Target maximum value
-                    max_target = other_val * ratio
-
-                    # Calculate violation
-                    violation = F.relu(current_val - max_target)
-
-                    # Apply correction
-                    corrected = current_val - violation
-
-                    # Update tensors
-                    result[:, col_idx] = corrected
-                    synthetic_dict[col] = corrected
-
-        return result
-
-    def calculate_physics_loss(self, synthetic):
-        """Enhanced physics-based loss calculation"""
-        loss = torch.tensor(0.0, device=self.device)
-
-        # Dictionary for easier access
-        synthetic_dict = {col: synthetic[:, i] for i, col in enumerate(self.numerical_cols)}
-
-        # Range violations penalties - softer approach
-        for i, col in enumerate(self.numerical_cols):
-            if col in self.num_ranges:
-                min_val, max_val = self.num_ranges[col]
-                if min_val is not None:
-                    loss += torch.sigmoid((min_val - synthetic[:, i]) * 5).mean()
-                if max_val is not None:
-                    loss += torch.sigmoid((synthetic[:, i] - max_val) * 5).mean()
-
-        # Distribution matching penalties
-        for i, col in enumerate(self.numerical_cols):
-            if col in self.column_stats:
-                stats = self.column_stats[col]
-                # Encourage values to stay within statistical norms
-                mean_dev = torch.abs(synthetic[:, i].mean() - stats['mean'])
-                std_dev = torch.abs(synthetic[:, i].std() - stats['std'])
-                loss += mean_dev * 2.0  # Penalize mean deviation
-                loss += std_dev * 2.0  # Penalize std deviation
-
-        # Relational constraint penalties
-        for col, meta in self.metadata.items():
-            if col not in self.numerical_cols:
-                continue
-
-            for constraint in getattr(meta, 'constraints', []):
-                other_col = constraint.get('other_column')
-                if other_col not in synthetic_dict:
-                    continue
-
-                # Handle greater_than constraint
-                if constraint['type'] == 'greater_than':
-                    margin = constraint.get('margin', 0)
-                    violation = F.relu(synthetic_dict[other_col] - synthetic_dict[col] + margin)
-                    loss += (violation ** 2).mean() * 5  # Stronger quadratic penalty
-
-                # Handle less_than constraint
-                elif constraint['type'] == 'less_than':
-                    margin = constraint.get('margin', 0)
-                    violation = F.relu(synthetic_dict[col] - synthetic_dict[other_col] + margin)
-                    loss += (violation ** 2).mean() * 5  # Stronger quadratic penalty
-
-                # Handle min_ratio constraint
-                elif constraint['type'] == 'min_ratio':
-                    ratio = constraint.get('ratio', 1.0)
-                    # Ensure col >= other_col * ratio
-                    violation = F.relu(synthetic_dict[other_col] * ratio - synthetic_dict[col])
-                    loss += (violation ** 2).mean() * 5  # Stronger quadratic penalty
-
-                # Handle max_ratio constraint
-                elif constraint['type'] == 'max_ratio':
-                    ratio = constraint.get('ratio', 1.0)
-                    # Ensure col <= other_col * ratio
-                    violation = F.relu(synthetic_dict[col] - synthetic_dict[other_col] * ratio)
-                    loss += (violation ** 2).mean() * 5  # Stronger quadratic penalty
-
-        # Apply configurable weight
-        return loss * self.config.phys_weight
 
     def wasserstein_loss(self, real_pred, fake_pred):
         """Standard Wasserstein loss"""
@@ -743,8 +535,6 @@ class WGAN:
         noise = torch.randn(batch_size, self.config.latent_dim, device=self.device)
         fake_num = self.generator(noise, real_cat)
 
-        #fake_num = self.apply_physics_constraints(fake_num)
-
         # Add small noise to real and fake data for stability
         real_num_noise = real_num + torch.randn_like(real_num) * 0.01
         fake_num_noise = fake_num + torch.randn_like(fake_num) * 0.01
@@ -786,7 +576,6 @@ class WGAN:
 
         # Initialize generator metrics
         g_loss = torch.tensor(0.0, device=self.device)
-        phys_loss = torch.tensor(0.0, device=self.device)
         total_g_loss = torch.tensor(0.0, device=self.device)
         g_grad_norm = torch.tensor(0.0, device=self.device)
         fm_loss = torch.tensor(0.0, device=self.device)
@@ -803,12 +592,6 @@ class WGAN:
                 logger.error(f"NaN positions: {torch.isnan(fake_num).nonzero()}")
                 fake_num = torch.nan_to_num(fake_num, nan=0.0)
 
-            # Apply constraints - this creates a new tensor
-            #fake_num = self.apply_physics_constraints(fake_num)
-
-            # Apply physics-based constraints and calculate physics loss
-            #phys_loss = self.calculate_physics_loss(fake_num)
-
             # Get discriminator predictions for generator loss
             if self.config.feature_matching:
                 g_fake, fake_features = self.discriminator(fake_num, real_cat)
@@ -823,14 +606,13 @@ class WGAN:
             g_loss = -g_fake.mean()
 
             # Total generator loss with physics constraints and feature matching
-            total_g_loss = g_loss + phys_loss + fm_loss
+            total_g_loss = g_loss + fm_loss
 
             # Check for gradients
             if total_g_loss.grad_fn is None:
                 logger.error("Generator has no gradients! Check architecture")
                 logger.error(f"g_fake grad_fn: {g_fake.grad_fn}")
                 logger.error(f"fake_num grad_fn: {fake_num.grad_fn}")
-                logger.warning(f"g_loss: {g_loss.item():.4f}, phys_loss: {phys_loss.item():.4f}, fm_loss: {fm_loss.item():.4f}")
                 logger.warning(f"fake_num requires_grad: {fake_num.requires_grad}")
                 logger.warning(f"generator parameters require grad: {any(p.requires_grad for p in self.generator.parameters())}")
 
@@ -849,53 +631,12 @@ class WGAN:
         return {
             'd_loss': d_loss.item(),
             'g_loss': total_g_loss.item(),
-            'phys_loss': phys_loss.item() if isinstance(phys_loss, torch.Tensor) else 0.0,
             'wasserstein': loss_d.item(),
             'gp': gp.item(),
             'feature_matching': fm_loss.item() if isinstance(fm_loss, torch.Tensor) else 0.0,
             'd_grad': d_grad_norm.item(),
             'g_grad': g_grad_norm.item() if generator_update else 0.0
         }
-
-    def progressive_train(self, epochs_per_stage=None):
-        """Progressive training approach with curriculum learning"""
-        if epochs_per_stage is None:
-            epochs_per_stage = self.config.num_epochs_per_stage
-
-        total_stages = 3
-        logger.info(f"Starting progressive training with {total_stages} stages, {epochs_per_stage} epochs per stage")
-
-        # Store original config values
-        original_phys_weight = self.config.phys_weight
-
-        # First stage: Train with higher noise and lower physics weight
-        self.config.phys_weight = original_phys_weight * 0.5
-        self.config.noise_level = 0.1
-        logger.info(f"Stage 1: Higher noise (0.1), reduced physics weight ({self.config.phys_weight:.4f})")
-        stage1_history = self.train(epochs_per_stage)
-
-        # Second stage: Medium noise, normal physics weight
-        self.config.phys_weight = original_phys_weight
-        self.config.noise_level = 0.05
-        logger.info(f"Stage 2: Medium noise (0.05), normal physics weight ({self.config.phys_weight:.4f})")
-        stage2_history = self.train(epochs_per_stage)
-
-        # Third stage: Low noise, high physics weight for refinement
-        self.config.phys_weight = original_phys_weight * 1.5
-        self.config.noise_level = 0.02
-        logger.info(f"Stage 3: Low noise (0.02), increased physics weight ({self.config.phys_weight:.4f})")
-        stage3_history = self.train(epochs_per_stage)
-
-        # Combine histories
-        combined_history = {}
-        for key in stage1_history:
-            combined_history[key] = stage1_history[key] + stage2_history[key] + stage3_history[key]
-
-        # Reset config to original values
-        self.config.phys_weight = original_phys_weight
-        self.config.noise_level = 0.05
-
-        return combined_history
 
     def train(self, epochs=None):
         """Optimized training loop with configurable parameters"""
@@ -912,7 +653,6 @@ class WGAN:
             metrics_history = {
                 'g_loss': [],
                 'd_loss': [],
-                'phys_loss': [],
                 'wasserstein': [],
                 'gp': [],
                 'feature_matching': [],
@@ -965,7 +705,6 @@ class WGAN:
                             f"Epoch {epoch + 1}/{epochs} Batch {batch_idx}/{total_batches} | "
                             f"G Loss: {step_metrics['g_loss']:.4f} | "
                             f"D Loss: {step_metrics['d_loss']:.4f} | "
-                            f"Phys Loss: {step_metrics['phys_loss']:.4f} | "
                             f"G Grad: {step_metrics['g_grad']:.2f} | "
                             f"D Grad: {step_metrics['d_grad']:.2f} | "
                             f"W-dist: {-step_metrics['wasserstein']:.4f}"
@@ -993,7 +732,6 @@ class WGAN:
                     f"Time: {epoch_time:.2f}s | "
                     f"Avg G Loss: {epoch_metrics['g_loss']:.4f} | "
                     f"Avg D Loss: {epoch_metrics['d_loss']:.4f} | "
-                    f"Avg Phys Loss: {epoch_metrics['phys_loss']:.4f} | "
                     f"Avg W-dist: {-epoch_metrics['wasserstein']:.4f} | "
                     f"Generator Updates: {generator_updates}/{epoch_batches} ({generator_updates / epoch_batches * 100:.1f}%)"
                 )
@@ -1022,12 +760,10 @@ class WGAN:
                     self.scheduler_d.step()
 
                 # Early stopping check
-                current_loss = epoch_metrics['g_loss'] + epoch_metrics['phys_loss']
-                if current_loss < best_loss - 0.01:  # Improvement threshold
+                current_loss = epoch_metrics['g_loss']
+                if current_loss < best_loss * 0.99:  # 1% improvement
                     best_loss = current_loss
                     no_improve_epochs = 0
-                    # Save best model
-                    # self._save_checkpoint('best_model.pt')
                 else:
                     no_improve_epochs += 1
                     if no_improve_epochs >= self.config.patience:
@@ -1061,7 +797,6 @@ class WGAN:
 
             # Generate samples
             fake_num = self.generator(noise, cat_samples)
-            fake_num = self.apply_physics_constraints(fake_num)
 
             # Move to CPU for evaluation
             fake_num = fake_num.cpu().numpy()
@@ -1076,6 +811,10 @@ class WGAN:
                     f"Min={np.min(col_data):.4f}, "
                     f"Max={np.max(col_data):.4f}"
                 )
+
+            for name, param in self.generator.named_parameters():
+                if 'weight_v' in name:  # Spectral norm parameters
+                    logger.info(f"Spectral norm {name}: {param.data.mean().item():.4f}")
 
         self.generator.train()
 
@@ -1093,13 +832,6 @@ class WGAN:
         if history['d_loss'][-1] < -200 or history['g_loss'][-1] > 200:
             logger.warning("Loss divergence detected, stopping training")
             return True
-
-        # Check for plateaued physics loss
-        if epoch > self.config.patience:
-            recent_phys = history['phys_loss'][-self.config.patience:]
-            if all(abs(recent_phys[i] - recent_phys[i - 1]) < 0.001 for i in range(1, len(recent_phys))):
-                logger.info("Physics loss plateaued, stopping training")
-                return True
 
         return False
 
@@ -1136,9 +868,6 @@ class WGAN:
 
                 # Generate synthetic numerical data
                 synthetic_num = self.generator(noise, cat_samples)
-
-                # Apply constraints
-                synthetic_num = self.apply_physics_constraints(synthetic_num)
 
                 # Add to collection
                 all_synthetic_num.append(synthetic_num.cpu().numpy())
@@ -1179,14 +908,6 @@ class WGAN:
                     logger.error(f"Input stats - min: {np.min(synthetic_num)}, max: {np.max(synthetic_num)}")
                     logger.error(f"NaN count: {np.isnan(synthetic_num).sum()}")
                     raise
-
-                # Check for NaN/inf values
-                # if np.isnan(inverted_num_data).any():
-                #    logger.warning("NaN values detected in inverted data")
-                # if np.isinf(inverted_num_data).any():
-                #    logger.warning("Inf values detected in inverted data")
-
-                #synthetic_df = pd.DataFrame(inverted_num_data, columns=self.numerical_cols)
             else:
                 synthetic_df = pd.DataFrame(columns=self.numerical_cols)
 
@@ -1223,7 +944,7 @@ class WGAN:
                     synthetic_df[col] = self._generate_string_column(meta, n_samples)
 
             # Apply final consistency checks
-            synthetic_df = self._post_process_constraints(synthetic_df)
+            synthetic_df = self._post_process(synthetic_df)
 
             return synthetic_df
 
@@ -1297,7 +1018,7 @@ class WGAN:
             # Default to email if no strategy specified
             return [self.faker.email() for _ in range(n_samples)]
 
-    def _post_process_constraints(self, df):
+    def _post_process(self, df):
         """Apply final post-processing to ensure constraints are met"""
         # Apply range constraints
         for col, (min_val, max_val) in self.num_ranges.items():
@@ -1306,43 +1027,4 @@ class WGAN:
                     df[col] = np.maximum(df[col], min_val)
                 if max_val is not None:
                     df[col] = np.minimum(df[col], max_val)
-
-        # Apply relational constraints
-        for col, meta in self.metadata.items():
-            if col not in df.columns:
-                continue
-
-            for constraint in getattr(meta, 'constraints', []):
-                other_col = constraint.get('other_column')
-                if other_col not in df.columns:
-                    continue
-
-                if constraint['type'] == 'greater_than':
-                    margin = constraint.get('margin', 0)
-                    violation_mask = df[col] <= df[other_col] - margin
-                    if violation_mask.any():
-                        # Fix violations by adjusting the column value
-                        df.loc[violation_mask, col] = df.loc[violation_mask, other_col] - margin + 0.01
-
-                elif constraint['type'] == 'less_than':
-                    margin = constraint.get('margin', 0)
-                    violation_mask = df[col] >= df[other_col] + margin
-                    if violation_mask.any():
-                        # Fix violations by adjusting the column value
-                        df.loc[violation_mask, col] = df.loc[violation_mask, other_col] + margin - 0.01
-
-                elif constraint['type'] == 'min_ratio':
-                    ratio = constraint.get('ratio', 1.0)
-                    violation_mask = df[col] < df[other_col] * ratio
-                    if violation_mask.any():
-                        # Fix violations
-                        df.loc[violation_mask, col] = df.loc[violation_mask, other_col] * ratio * 1.01
-
-                elif constraint['type'] == 'max_ratio':
-                    ratio = constraint.get('ratio', 1.0)
-                    violation_mask = df[col] > df[other_col] * ratio
-                    if violation_mask.any():
-                        # Fix violations
-                        df.loc[violation_mask, col] = df.loc[violation_mask, other_col] * ratio * 0.99
-
         return df

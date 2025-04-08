@@ -12,7 +12,6 @@ class FieldMetadata:
             # For numerical fields
             min_value: Optional[float] = None,
             max_value: Optional[float] = None,
-            constraints: Optional[List[Dict]] = None,
 
             # For string fields
             fake_strategy: Optional[str] = None,
@@ -22,7 +21,6 @@ class FieldMetadata:
         self.data_type = data_type
         self.min_value = min_value
         self.max_value = max_value
-        self.constraints = constraints or []
         self.fake_strategy = fake_strategy
         self.custom_faker = custom_faker
         self.string_format = string_format
@@ -45,15 +43,3 @@ class FieldMetadata:
                 fake = Faker()
                 if self.fake_strategy not in dir(fake):
                     raise ValueError(f"Invalid fake strategy: {self.fake_strategy}")
-
-    def add_constraint(self, constraint_type: str, other_column: str, **kwargs):
-        """Add a relational constraint to this field"""
-        valid_types = ['greater_than', 'less_than', 'positive_correlation']
-        if constraint_type not in valid_types:
-            raise ValueError(f"Invalid constraint type. Must be one of: {valid_types}")
-
-        self.constraints.append({
-            'type': constraint_type,
-            'other_column': other_column,
-            **kwargs
-        })
