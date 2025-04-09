@@ -7,6 +7,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from scipy.interpolate import interp1d
 from torch import optim
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.pipeline import Pipeline
@@ -28,7 +29,7 @@ class GANConfig:
             self,
             latent_dim: int = 256,
             batch_size: int = 64,
-            n_critic: int = 5,
+            n_critic: int = 15,
             gp_weight: float = 5.0,
             g_lr: float = 1e-5,
             d_lr: float = 1e-5,
@@ -210,17 +211,28 @@ class WGAN:
         }
 
         # Preprocess data and initialize models
-        self.preprocess_data()
+        self.preprocess_data(real_data_length=len(real_data))
         self.init_models()
 
-    def preprocess_data(self):
+    def preprocess_data(self, real_data_length):
         """Preprocess data with proper normalization"""
         # Numerical pipeline
         if self.config.normalization_method == 'quantile':
+            #num_pipeline = Pipeline([
+            #    ('imputer', SimpleImputer(strategy='median', add_indicator=True)),
+            #    ('quantile', QuantileTransformer(output_distribution='normal', n_quantiles=1000)),
+            #    # ('scaler', StandardScaler())
+            #])
+            from sklearn.preprocessing import RobustScaler,FunctionTransformer
             num_pipeline = Pipeline([
                 ('imputer', SimpleImputer(strategy='median', add_indicator=True)),
-                ('quantile', QuantileTransformer(output_distribution='normal', n_quantiles=1000)),
-                # ('scaler', StandardScaler())
+                ('robust', RobustScaler()),
+                ('quantile', QuantileTransformer(
+                    output_distribution='normal',
+                    n_quantiles=min(1000, real_data_length // 10),
+                    subsample=100000)),
+                ('clip', FunctionTransformer(
+                    func=lambda x: np.clip(x, -5, 5)))
             ])
         else:  # Default to standard scaling
             num_pipeline = Pipeline([
@@ -303,7 +315,7 @@ class WGAN:
         # Mixed precision
         self.scaler = torch.amp.GradScaler(enabled=self.config.use_mixed_precision)
 
-    def train_step(self, real_num, real_cat, epoch, batch_idx):
+    def train_step(self, real_num, real_cat, epoch, epochs, batch_idx):
         """Ultra-stable WGAN training step"""
         # 1. CUDA initialization and input validation
         torch.cuda.empty_cache()
@@ -318,8 +330,10 @@ class WGAN:
         batch_size = real_num.size(0)
 
         # 2. Conservative noise generation
-        noise = torch.randn(batch_size, self.config.latent_dim,
-                            device=self.device) * 0.05  # Reduced noise scale
+        #noise = torch.randn(batch_size, self.config.latent_dim, device=self.device) * 0.05
+
+        noise_scale = max(0.05, 1.0 - (epoch / epochs))  # Decreases over time
+        noise = torch.randn(batch_size, self.config.latent_dim, device=self.device) * noise_scale
 
         # 3. Discriminator Update - Simplified
         self.opt_d.zero_grad(set_to_none=True)
@@ -369,7 +383,10 @@ class WGAN:
 
             dist_loss = self.distribution_matching_loss(real_num, fake_num) * 10.0
 
-            g_loss = (-d_fake.mean() + dist_loss)
+            #g_loss = (-d_fake.mean() + dist_loss)
+            current_epoch_ratio = min(1.0, epoch / 50)  # Ramp up over 50 epochs
+            g_loss = (-d_fake.mean() + current_epoch_ratio * dist_loss * 5.0)
+
             g_loss.backward()
 
             g_grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -495,7 +512,7 @@ class WGAN:
                         continue
 
                     # Training step with recovery
-                    metrics = self.train_step(real_num, real_cat, epoch, batch_idx)
+                    metrics = self.train_step(real_num, real_cat, epoch, epochs, batch_idx)
                     if metrics is None:
                         self._recover_from_failure()
                         continue
@@ -539,10 +556,90 @@ class WGAN:
                 break
 
             # Periodic evaluation
-            if (epoch + 1) % 5 == 0:
+            if (epoch + 1) % 5 == 0 or epoch == 0:
                 self._evaluate_progress(epoch + 1)
 
+                # Wasserstein distance for first 5 numerical columns
+                with torch.no_grad():
+                    samples = self.generate(min(1000, len(self.real_data)))
+
+                    logger.info("\n=== Distribution Metrics ===")
+                    for col in self.numerical_cols[:5]:
+                        if col in self.real_data.columns and col in samples.columns:
+                            w_dist = self._calculate_wasserstein(
+                                self.real_data[col],
+                                samples[col]
+                            )
+                            logger.info(f"Wasserstein {col}: {w_dist:.4f}")
+                    logger.info("=" * 30)
+
         return self.history
+
+    def _calculate_wasserstein(self, real, synthetic):
+        """Calculate Wasserstein distance between real and synthetic samples"""
+        # Convert to numpy if needed
+        if isinstance(real, pd.Series):
+            real = real.values
+        if isinstance(synthetic, pd.Series):
+            synthetic = synthetic.values
+
+        # Sort the values
+        real_sorted = np.sort(real)
+        synth_sorted = np.sort(synthetic)
+
+        # Calculate the distance
+        n = len(real_sorted)
+        m = len(synth_sorted)
+        all_sorted = np.sort(np.concatenate([real_sorted, synth_sorted]))
+
+        # Compute the cumulative distributions
+        cdf_real = np.searchsorted(real_sorted, all_sorted, side='right') / n
+        cdf_synth = np.searchsorted(synth_sorted, all_sorted, side='right') / m
+
+        # Integrate the absolute difference
+        return np.trapz(np.abs(cdf_real - cdf_synth), all_sorted)
+
+    def calibrate_numeric_columns(self, synthetic_df):
+        """Adjust synthetic data to better match original distributions"""
+        for col in self.numerical_cols:
+            if col not in self.real_data.columns:
+                continue
+
+            # 1. Handle duplicate values by adding tiny noise
+            synth_vals = synthetic_df[col].values.copy()
+            if len(np.unique(synth_vals)) < len(synth_vals):
+                noise = np.random.normal(0, 1e-10 * synth_vals.std(), size=len(synth_vals))
+                synth_vals = synth_vals + noise
+
+            # 2. Calculate quantiles with epsilon padding
+            epsilon = 1e-10
+            quantiles = np.linspace(epsilon, 1 - epsilon, 100)
+
+            try:
+                orig_quantiles = np.quantile(self.real_data[col], quantiles)
+                synth_quantiles = np.quantile(synth_vals, quantiles)
+
+                # 3. Create robust mapping function
+                valid_mask = ~np.isnan(orig_quantiles) & ~np.isnan(synth_quantiles)
+                if valid_mask.sum() > 1:  # Need at least 2 points for interpolation
+                    mapping = interp1d(
+                        synth_quantiles[valid_mask],
+                        orig_quantiles[valid_mask],
+                        bounds_error=False,
+                        fill_value="extrapolate",
+                        assume_sorted=True
+                    )
+                    synthetic_df[col] = mapping(synth_vals)
+            except Exception as e:
+                logger.warning(f"Calibration failed for {col}: {str(e)}")
+                continue
+
+            # 4. Ensure constraints are still met
+            if col in self.num_ranges:
+                min_val, max_val = self.num_ranges[col]
+                synthetic_df[col] = synthetic_df[col].clip(min_val, max_val)
+
+        return synthetic_df
 
     def _recover_from_failure(self):
         """Simplified recovery without scaler update"""
@@ -684,6 +781,9 @@ class WGAN:
                     synthetic_df[col] = self._generate_datetime_column(col, n_samples)
                 elif meta.data_type == DataType.STRING:
                     synthetic_df[col] = self._generate_string_column(meta, n_samples)
+
+            # Post-generation calibration for numeric columns
+            synthetic_df = self.calibrate_numeric_columns(synthetic_df)
 
             return synthetic_df
 
