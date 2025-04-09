@@ -114,10 +114,10 @@ class DataGenerator:
             metadata: Dict[str, FieldMetadata],
             method: MethodType = MethodType.WGAN,
             synthetic_size: Optional[int] = None,
-            epochs: int = 50
+            epochs: int = 200
     ) -> pd.DataFrame:
         """Generate synthetic data using specified method"""
-        synthetic_size = synthetic_size or len(real_data) // 2
+        synthetic_size = synthetic_size or len(real_data)
 
         logger.info(f"Generating {synthetic_size} synthetic samples using {method.value}")
 

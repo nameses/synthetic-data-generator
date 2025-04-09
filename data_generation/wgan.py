@@ -220,7 +220,7 @@ class WGAN:
             num_pipeline = Pipeline([
                 ('imputer', SimpleImputer(strategy='median', add_indicator=True)),
                 ('quantile', QuantileTransformer(output_distribution='normal', n_quantiles=1000)),
-                ('scaler', StandardScaler())
+                # ('scaler', StandardScaler())
             ])
         else:  # Default to standard scaling
             num_pipeline = Pipeline([
@@ -250,7 +250,7 @@ class WGAN:
         self.num_categorical = 0
         if 'cat' in self.preprocessor.named_transformers_:
             self.num_categorical = \
-            self.preprocessor.named_transformers_['cat'].named_steps['onehot'].get_feature_names_out().shape[0]
+                self.preprocessor.named_transformers_['cat'].named_steps['onehot'].get_feature_names_out().shape[0]
 
         # Create tensors
         self.X_num = torch.FloatTensor(self.processed_data[:, :self.num_numerical])
@@ -303,38 +303,6 @@ class WGAN:
         # Mixed precision
         self.scaler = torch.amp.GradScaler(enabled=self.config.use_mixed_precision)
 
-    def gradient_penalty(self, real_data, fake_data, labels=None):
-        """Calculate gradient penalty for WGAN-GP"""
-        batch_size = real_data.size(0)
-        alpha = torch.rand(batch_size, 1, device=self.device)
-
-        # Interpolate between real and fake data
-        interpolates = alpha * real_data + (1 - alpha) * fake_data
-        interpolates.requires_grad_(True)
-
-        # Discriminator output
-        if labels is not None:
-            disc_interpolates = self.discriminator(interpolates, labels)[0]
-        else:
-            disc_interpolates = self.discriminator(interpolates)[0]
-
-        # Calculate gradients
-        gradients = torch.autograd.grad(
-            outputs=disc_interpolates,
-            inputs=interpolates,
-            grad_outputs=torch.ones_like(disc_interpolates, device=self.device),
-            create_graph=True,
-            retain_graph=True,
-            only_inputs=True
-        )[0]
-
-        # Calculate penalty
-        gradients = gradients.view(batch_size, -1)
-        gradient_norm = torch.sqrt(torch.sum(gradients ** 2, dim=1) + 1e-12)
-        penalty = ((gradient_norm - 1) ** 2).mean()
-
-        return penalty * self.config.gp_weight
-
     def train_step(self, real_num, real_cat, epoch, batch_idx):
         """Ultra-stable WGAN training step"""
         # 1. CUDA initialization and input validation
@@ -366,7 +334,7 @@ class WGAN:
 
         # Stabilized loss calculation
         wasserstein_loss = torch.clamp(d_fake.mean() - d_real.mean(), -1.0, 1.0)
-        gp = self._ultra_safe_gradient_penalty(real_num, fake_num, real_cat)
+        gp = self.gradient_penalty(real_num, fake_num, real_cat)
         d_loss = wasserstein_loss + gp * min(2.0, self.config.gp_weight * 0.1)  # Reduced GP
 
         # Manual gradient handling
@@ -399,8 +367,9 @@ class WGAN:
             fake_num = torch.clamp(fake_num, -3.0, 3.0)
             d_fake = self.discriminator(fake_num, real_cat)[0]
 
-            # Very conservative generator loss
-            g_loss = -d_fake.mean() * 0.2  # Reduced impact
+            dist_loss = self.distribution_matching_loss(real_num, fake_num) * 10.0
+
+            g_loss = (-d_fake.mean() + dist_loss)
             g_loss.backward()
 
             g_grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -429,7 +398,33 @@ class WGAN:
             'lr_d': self.opt_d.param_groups[0]['lr']
         }
 
-    def _ultra_safe_gradient_penalty(self, real_data, fake_data, labels=None):
+    def distribution_matching_loss(self, real_data, fake_data):
+        """Improved distribution matching using multiple metrics"""
+        # 1. Moment matching (mean, std)
+        moment_loss = F.mse_loss(fake_data.mean(dim=0), real_data.mean(dim=0)) + \
+                      F.mse_loss(fake_data.std(dim=0), real_data.std(dim=0))
+
+        # 2. Quantile matching (captures full distribution shape)
+        quantiles = torch.linspace(0.1, 0.9, 5).to(real_data.device)
+        real_quantiles = torch.quantile(real_data, quantiles, dim=0)
+        fake_quantiles = torch.quantile(fake_data, quantiles, dim=0)
+        quantile_loss = F.mse_loss(fake_quantiles, real_quantiles)
+
+        # 3. Histogram matching (fine-grained distribution)
+        bins = 20
+        hist_loss = 0
+        for i in range(real_data.shape[1]):
+            real_hist = torch.histc(real_data[:, i], bins=bins, min=-3, max=3)
+            fake_hist = torch.histc(fake_data[:, i], bins=bins, min=-3, max=3)
+            hist_loss += F.kl_div(
+                F.log_softmax(fake_hist, dim=0),
+                F.softmax(real_hist, dim=0),
+                reduction='batchmean'
+            )
+
+        return moment_loss + quantile_loss + (hist_loss / real_data.shape[1])
+
+    def gradient_penalty(self, real_data, fake_data, labels=None):
         """Bulletproof gradient penalty calculation"""
         batch_size = real_data.size(0)
 
@@ -724,13 +719,6 @@ class WGAN:
 
         except Exception as e:
             logger.error(f"Evaluation failed: {str(e)}")
-
-    def _evaluate_generator(self, epoch):
-        """Evaluate generator quality"""
-        samples = self.generate(100)
-        logger.info(f"Epoch {epoch} sample stats:")
-        for col in samples.columns[:3]:  # Show first 3 columns
-            logger.info(f"{col}: mean={samples[col].mean():.4f}, std={samples[col].std():.4f}")
 
     def _generate_datetime_column(self, col, n_samples):
         """Generate datetime column"""
