@@ -1,28 +1,23 @@
 # data_generation/wgan.py
 import time
-
-import sklearn.preprocessing
+import logging
+import math
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.impute import SimpleImputer
 from torch import optim
 from torch.utils.data import DataLoader, TensorDataset
-import numpy as np
-import pandas as pd
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import QuantileTransformer, StandardScaler, OneHotEncoder, PowerTransformer
+from sklearn.preprocessing import QuantileTransformer, StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
 from typing import Dict, Optional, List, Union, Tuple
 from models.enums import DataType
 from models.field_metadata import FieldMetadata
 from faker import Faker
-import logging
-import math
-from functools import partial
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -31,26 +26,23 @@ class GANConfig:
 
     def __init__(
             self,
-            latent_dim: int = 512,
-            batch_size: int = 128,
-            n_critic: int = 1,
-            gp_weight: float = 10.0,
-            g_lr: float = 1e-4,
-            d_lr: float = 1e-4,
+            latent_dim: int = 256,
+            batch_size: int = 64,
+            n_critic: int = 5,
+            gp_weight: float = 5.0,
+            g_lr: float = 1e-5,
+            d_lr: float = 1e-5,
             g_betas: tuple = (0.5, 0.9),
             d_betas: tuple = (0.5, 0.9),
-            patience: int = 25,
-            clip_value: float = 0.5,
+            patience: int = 20,
+            clip_value: float = 0.1,
             use_mixed_precision: bool = True,
             spectral_norm: bool = True,
-            residual_blocks: bool = True,
-            noise_level: float = 0.05,
+            noise_level: float = 0.1,
             minibatch_std: bool = True,
             feature_matching: bool = True,
-            num_epochs_per_stage: int = 10,
-            max_epochs: int = 500,
-            scheduler_type: str = 'cosine',
-            normalization_method: str = 'power',
+            max_epochs: int = 200,
+            normalization_method: str = 'quantile',
     ):
         self.latent_dim = latent_dim
         self.batch_size = batch_size
@@ -64,231 +56,121 @@ class GANConfig:
         self.clip_value = clip_value
         self.use_mixed_precision = use_mixed_precision
         self.spectral_norm = spectral_norm
-        self.residual_blocks = residual_blocks
         self.noise_level = noise_level
         self.minibatch_std = minibatch_std
         self.feature_matching = feature_matching
-        self.num_epochs_per_stage = num_epochs_per_stage
         self.max_epochs = max_epochs
-        self.scheduler_type = scheduler_type
         self.normalization_method = normalization_method
 
 
-def apply_spectral_norm(module, apply_spectral_norm=True):
-    """Apply spectral norm to a single module"""
-    return nn.utils.spectral_norm(module) if apply_spectral_norm else module
-
-
 class MinibatchStdDev(nn.Module):
-    """Minibatch Standard Deviation Layer for the Discriminator"""
+    """Minibatch Standard Deviation Layer"""
 
-    def __init__(self, averaging='all'):
+    def __init__(self):
         super().__init__()
-        self.averaging = averaging
 
     def forward(self, x):
-        # [N, C, ...] Input shape
-        batch_size = x.shape[0]
-        if batch_size < 2:  # Skip if batch is too small
+        batch_size = x.size(0)
+        if batch_size < 2:
             return x
 
-        # [N, 1, ...] Standard deviation across batch dimension
-        std = torch.std(x, dim=0, unbiased=False)
+        # Calculate std over batch
+        std = torch.std(x, dim=0, keepdim=True)
+        mean_std = torch.mean(std, dim=1, keepdim=True)
 
-        # Average across feature channels and spatial dimensions
-        mean_std = torch.mean(std)
-        mean_std = mean_std.expand(batch_size, 1)
-
-        # Append as a new feature map
+        # Expand and concatenate
+        mean_std = mean_std.expand(x.size(0), -1)
         return torch.cat([x, mean_std], dim=1)
-
-
-class ResidualBlock(nn.Module):
-    def __init__(self, in_features, out_features, config: GANConfig):
-        super().__init__()
-        self.config = config
-
-        # First linear layer with spectral norm
-        self.linear1 = apply_spectral_norm(
-            nn.Linear(in_features, out_features),
-            config.spectral_norm
-        )
-        self.norm1 = nn.LayerNorm(out_features)
-        self.activation = nn.LeakyReLU(0.2)
-
-        # Second linear layer with spectral norm
-        self.linear2 = apply_spectral_norm(
-            nn.Linear(out_features, out_features),
-            config.spectral_norm
-        )
-        self.norm2 = nn.LayerNorm(out_features)
-
-        # Shortcut connection
-        self.shortcut = nn.Linear(in_features, out_features) if in_features != out_features else nn.Identity()
-
-        # Dropout for regularization
-        self.dropout = nn.Dropout(0.1)
-
-    def forward(self, x):
-        identity = x
-
-        out = self.linear1(x)
-        out = self.norm1(out)
-        out = self.activation(out)
-        out = self.dropout(out)
-
-        out = self.linear2(out)
-        out = self.norm2(out)
-
-        # Use addition operator (+) instead of in-place add (+=)
-        out = out + self.shortcut(identity)
-        out = self.activation(out)
-
-        return out
 
 
 class WGANGenerator(nn.Module):
     def __init__(self, config: GANConfig, output_dim: int, num_categories: int = 0):
         super().__init__()
         self.config = config
-        self.latent_dim = config.latent_dim
-        self.output_dim = output_dim
+        input_dim = config.latent_dim + num_categories
 
-        # Input dimension includes latent vector and optional category labels
-        in_features = config.latent_dim + num_categories
+        layers = []
+        hidden_dims = [256, 512, 256]
 
-        # Input layer - smaller initial size for more stable training
-        self.input_layer = nn.Sequential(
-            apply_spectral_norm(nn.Linear(in_features, 128), config.spectral_norm),
-            nn.LayerNorm(128),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(0.1)  # Add dropout for regularization
-        )
+        # Input layer
+        layers.append(nn.Linear(input_dim, hidden_dims[0]))
+        if config.spectral_norm:
+            layers[-1] = nn.utils.spectral_norm(layers[-1])
+        layers.append(nn.LeakyReLU(0.2))
 
-        # Middle layers with different architectures
-        if config.residual_blocks:
-            self.middle_layers = nn.Sequential(
-                ResidualBlock(128, 256, config),
-                ResidualBlock(256, 512, config),
-                ResidualBlock(512, 512, config)  # Added extra depth
-            )
-        else:
-            self.middle_layers = nn.Sequential(
-                apply_spectral_norm(nn.Linear(128, 256), config.spectral_norm),
-                nn.LayerNorm(256),
-                nn.LeakyReLU(0.2),
-                nn.Dropout(0.1),
-                apply_spectral_norm(nn.Linear(256, 512), config.spectral_norm),
-                nn.LayerNorm(512),
-                nn.LeakyReLU(0.2),
-                nn.Dropout(0.1)
-            )
+        # Hidden layers
+        for i in range(1, len(hidden_dims)):
+            layers.append(nn.Linear(hidden_dims[i - 1], hidden_dims[i]))
+            if config.spectral_norm:
+                layers[-1] = nn.utils.spectral_norm(layers[-1])
+            layers.append(nn.LayerNorm(hidden_dims[i]))
+            layers.append(nn.LeakyReLU(0.2))
 
-        # Output layers - gradually reduce size
-        self.output_layers = nn.Sequential(
-            apply_spectral_norm(nn.Linear(512, 256), config.spectral_norm),
-            nn.LayerNorm(256),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(0.05),
-            nn.Linear(256, output_dim)
-        )
+        # Output layer
+        layers.append(nn.Linear(hidden_dims[-1], output_dim))
 
-        # Initialize weights for better convergence
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            nn.init.kaiming_normal_(m.weight, a=0.2, nonlinearity='leaky_relu')
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
+        self.net = nn.Sequential(*layers)
 
     def forward(self, noise, labels=None):
-        # Add small noise to prevent mode collapse
-        if self.training and self.config.noise_level > 0:
-            noise = noise + torch.randn_like(noise) * self.config.noise_level
-
         if labels is not None:
-            # Add small noise to categorical labels as well
-            if self.training and self.config.noise_level > 0:
-                label_noise = torch.randn_like(labels) * (self.config.noise_level * 0.1)
-                labels = labels + label_noise
             noise = torch.cat([noise, labels], dim=1)
-
-        x = self.input_layer(noise)
-        x = self.middle_layers(x)
-        return self.output_layers(x)
+        return self.net(noise)
 
 
 class WGANDiscriminator(nn.Module):
     def __init__(self, config: GANConfig, input_dim: int, num_categories: int = 0):
         super().__init__()
         self.config = config
-        self.feature_matching = config.feature_matching
+        input_dim = input_dim + num_categories
 
-        # Add input normalization
-        self.input_norm = nn.LayerNorm(input_dim + num_categories)
+        layers = []
+        hidden_dims = [256, 512, 256]
 
-        # Input dimension includes input vector and optional category labels
-        in_features = input_dim + num_categories
+        # Input layer
+        if config.minibatch_std:
+            input_dim += 1  # For minibatch std
 
-        # Feature extraction layers
-        self.features = nn.Sequential(
-            apply_spectral_norm(nn.Linear(in_features, 256), config.spectral_norm),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(0.1),
-            apply_spectral_norm(nn.Linear(256, 256), config.spectral_norm),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(0.1),
-        )
+        layers.append(nn.Linear(input_dim, hidden_dims[0]))
+        if config.spectral_norm:
+            layers[-1] = nn.utils.spectral_norm(layers[-1])
+        layers.append(nn.LeakyReLU(0.2))
 
-        # Optional minibatch standard deviation layer
-        self.use_minibatch_std = config.minibatch_std
-        if self.use_minibatch_std:
-            self.minibatch_std = MinibatchStdDev()
-            self.post_minibatch = nn.Sequential(
-                apply_spectral_norm(nn.Linear(256 + 1, 128), config.spectral_norm),  # +1 for minibatch std
-                nn.LeakyReLU(0.2),
-                nn.Dropout(0.1)
-            )
+        # Hidden layers
+        for i in range(1, len(hidden_dims)):
+            layers.append(nn.Linear(hidden_dims[i - 1], hidden_dims[i]))
+            if config.spectral_norm:
+                layers[-1] = nn.utils.spectral_norm(layers[-1])
+            layers.append(nn.LayerNorm(hidden_dims[i]))
+            layers.append(nn.LeakyReLU(0.2))
+
+        # Output layers
+        self.feature_layer = nn.Linear(hidden_dims[-1], hidden_dims[-1])
+        self.validity_layer = nn.Linear(hidden_dims[-1], 1)
+        if config.spectral_norm:
+            self.validity_layer = nn.utils.spectral_norm(self.validity_layer)
+
+        if num_categories > 0:
+            self.aux_layer = nn.Linear(hidden_dims[-1], num_categories)
         else:
-            self.post_features = nn.Sequential(
-                apply_spectral_norm(nn.Linear(256, 128), config.spectral_norm),
-                nn.LeakyReLU(0.2),
-                nn.Dropout(0.1)
-            )
+            self.aux_layer = None
 
-        # Output layer
-        self.output_layer = apply_spectral_norm(nn.Linear(128, 1), config.spectral_norm)
+        self.minibatch_std = MinibatchStdDev() if config.minibatch_std else None
+        self.net = nn.Sequential(*layers)
 
-        # Initialize weights
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            nn.init.kaiming_normal_(m.weight, a=0.2, nonlinearity='leaky_relu')
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-
-    def forward(self, inputs, labels=None):
+    def forward(self, x, labels=None):
         if labels is not None:
-            inputs = torch.cat([inputs, labels], dim=1)
+            x = torch.cat([x, labels], dim=1)
 
-        inputs = self.input_norm(inputs)
+        if self.minibatch_std is not None:
+            x = self.minibatch_std(x)
 
-        features = self.features(inputs)
+        features = self.net(x)
+        features = self.feature_layer(features)
 
-        if self.use_minibatch_std:
-            features = self.minibatch_std(features)
-            features = self.post_minibatch(features)
-        else:
-            features = self.post_features(features)
+        validity = self.validity_layer(features)
+        aux = self.aux_layer(features) if self.aux_layer is not None else None
 
-        output = self.output_layer(features)
-
-        if self.feature_matching and self.training:
-            return output, features
-        else:
-            return output
+        return validity, aux, features
 
 
 class WGAN:
@@ -298,57 +180,55 @@ class WGAN:
         self.config = config
         self.faker = Faker()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.history = {'g_loss': [], 'd_loss': [], 'grad_norms': []}
 
-        # Enable anomaly detection during development
-        # torch.autograd.set_detect_anomaly(True)
+        # Initialize history tracking
+        self.history = {
+            'g_loss': [], 'd_loss': [], 'wasserstein': [], 'gp': [],
+            'feature_matching': [], 'aux_loss': [], 'aux_g_loss': [],
+            'd_grad': [], 'g_grad': [], 'lr_g': [], 'lr_d': [], 'gp_weight': []
+        }
 
         # Identify column types
-        self.numerical_cols = [col for col, meta in metadata.items() if
-                               meta.data_type in [DataType.INTEGER, DataType.DECIMAL]]
-        self.categorical_cols = [col for col, meta in metadata.items() if
-                                 meta.data_type == DataType.CATEGORICAL]
-        self.boolean_cols = [col for col, meta in metadata.items() if
-                             meta.data_type == DataType.BOOLEAN]
+        self.numerical_cols = [col for col, meta in metadata.items()
+                               if meta.data_type in [DataType.INTEGER, DataType.DECIMAL]]
+        self.categorical_cols = [col for col, meta in metadata.items()
+                                 if meta.data_type == DataType.CATEGORICAL]
+        self.boolean_cols = [col for col, meta in metadata.items()
+                             if meta.data_type == DataType.BOOLEAN]
 
-        # Store original ranges and expected distributions
+        # Store original ranges
         self.num_ranges = {
             col: (meta.min_value, meta.max_value)
             for col, meta in metadata.items()
             if col in self.numerical_cols and meta.min_value is not None and meta.max_value is not None
         }
 
-        # Store boolean column distributions
-        self.bool_distributions = {}
-        for col in self.boolean_cols:
-            if col in real_data.columns:
-                true_prop = real_data[col].mean()
-                self.bool_distributions[col] = true_prop
+        # Store boolean distributions
+        self.bool_distributions = {
+            col: real_data[col].mean()
+            for col in self.boolean_cols if col in real_data.columns
+        }
 
+        # Preprocess data and initialize models
         self.preprocess_data()
         self.init_models()
 
     def preprocess_data(self):
-        """Enhanced preprocessing for better distribution preservation"""
-        # Choose normalization method based on config
-        if self.config.normalization_method == 'power':
+        """Preprocess data with proper normalization"""
+        # Numerical pipeline
+        if self.config.normalization_method == 'quantile':
             num_pipeline = Pipeline([
-                ('imputer', SimpleImputer(strategy='median', add_indicator=True)),  # Handle missing values
-                ('scaler', sklearn.preprocessing.RobustScaler()),  # Less sensitive to outliers
-                ('power', PowerTransformer(method='yeo-johnson'))  # Keep but with safeguards
-            ])
-        elif self.config.normalization_method == 'robust':
-            from sklearn.preprocessing import RobustScaler
-            num_pipeline = Pipeline([
-                ('quantile', QuantileTransformer(output_distribution='normal', n_quantiles=1000)),
-                ('robust', RobustScaler())
-            ])
-        else:  # Default to quantile
-            num_pipeline = Pipeline([
+                ('imputer', SimpleImputer(strategy='median', add_indicator=True)),
                 ('quantile', QuantileTransformer(output_distribution='normal', n_quantiles=1000)),
                 ('scaler', StandardScaler())
             ])
+        else:  # Default to standard scaling
+            num_pipeline = Pipeline([
+                ('imputer', SimpleImputer(strategy='median')),
+                ('scaler', StandardScaler())
+            ])
 
+        # Categorical pipeline
         cat_pipeline = Pipeline([
             ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
         ])
@@ -362,63 +242,45 @@ class WGAN:
 
         self.preprocessor = ColumnTransformer(transformers, remainder='drop')
 
-        # Fit and transform the data
+        # Fit and transform
         self.processed_data = self.preprocessor.fit_transform(self.real_data)
 
         # Get dimensions
         self.num_numerical = len(self.numerical_cols)
         self.num_categorical = 0
         if 'cat' in self.preprocessor.named_transformers_:
-            self.num_categorical = self.preprocessor.named_transformers_['cat'].named_steps['onehot'].get_feature_names_out().shape[0]
+            self.num_categorical = \
+            self.preprocessor.named_transformers_['cat'].named_steps['onehot'].get_feature_names_out().shape[0]
 
-        # Separate numerical and categorical data
-        if self.num_numerical > 0:
-            self.X_num = torch.FloatTensor(self.processed_data[:, :self.num_numerical])
-        else:
-            self.X_num = torch.FloatTensor(0)
+        # Create tensors
+        self.X_num = torch.FloatTensor(self.processed_data[:, :self.num_numerical])
+        self.X_cat = torch.FloatTensor(
+            self.processed_data[:, self.num_numerical:]) if self.num_categorical > 0 else None
 
-        if self.num_categorical > 0:
-            self.X_cat = torch.FloatTensor(
-                self.processed_data[:, self.num_numerical:])
-        else:
-            self.X_cat = None
-
-        # Create dataset and loader
+        # Create dataloader
         dataset = TensorDataset(self.X_num, self.X_cat) if self.X_cat is not None else TensorDataset(self.X_num)
-        self.loader = DataLoader(dataset, batch_size=self.config.batch_size, shuffle=True, drop_last=True)
-
-        logger.info(
-            f"Preprocessed data with {self.num_numerical} numerical features and {self.num_categorical} categorical features")
-
-        if self.numerical_cols:
-            self.numerical_cols = [col for col, meta in self.metadata.items()
-                                   if meta.data_type in [DataType.INTEGER, DataType.DECIMAL]]
-            logger.info(f"Numerical columns: {self.numerical_cols}")
-
-        if self.categorical_cols:
-            self.categorical_cols = [col for col, meta in self.metadata.items()
-                                     if meta.data_type == DataType.CATEGORICAL]
-            logger.info(f"Categorical columns: {self.categorical_cols}")
+        self.loader = DataLoader(
+            dataset,
+            batch_size=self.config.batch_size,
+            shuffle=True,
+            drop_last=True
+        )
 
     def init_models(self):
-        """Initialize models with improved architecture"""
+        """Initialize models with proper configuration"""
         self.generator = WGANGenerator(
             config=self.config,
             output_dim=self.num_numerical,
             num_categories=self.num_categorical
-        )
+        ).to(self.device)
 
         self.discriminator = WGANDiscriminator(
             config=self.config,
             input_dim=self.num_numerical,
             num_categories=self.num_categorical
-        )
+        ).to(self.device)
 
-        # Move models to device
-        self.generator.to(self.device)
-        self.discriminator.to(self.device)
-
-        # Setup optimizers with lower learning rates
+        # Optimizers
         self.opt_g = optim.Adam(
             self.generator.parameters(),
             lr=self.config.g_lr,
@@ -430,510 +292,395 @@ class WGAN:
             betas=self.config.d_betas
         )
 
-        # Setup learning rate schedulers
-        if self.config.scheduler_type == 'cosine':
-            self.scheduler_g = optim.lr_scheduler.CosineAnnealingLR(
-                self.opt_g, T_max=self.config.max_epochs, eta_min=self.config.g_lr * 0.1
-            )
-            self.scheduler_d = optim.lr_scheduler.CosineAnnealingLR(
-                self.opt_d, T_max=self.config.max_epochs, eta_min=self.config.d_lr * 0.1
-            )
-        elif self.config.scheduler_type == 'reduce':
-            self.scheduler_g = optim.lr_scheduler.ReduceLROnPlateau(
-                self.opt_g, mode='min', factor=0.5, patience=10, min_lr=1e-6, verbose=True
-            )
-            self.scheduler_d = optim.lr_scheduler.ReduceLROnPlateau(
-                self.opt_d, mode='min', factor=0.5, patience=10, min_lr=1e-6, verbose=True
-            )
-        else:  # Default to StepLR
-            self.scheduler_g = optim.lr_scheduler.StepLR(self.opt_g, step_size=30, gamma=0.5)
-            self.scheduler_d = optim.lr_scheduler.StepLR(self.opt_d, step_size=30, gamma=0.5)
+        # Learning rate schedulers
+        self.scheduler_g = optim.lr_scheduler.ReduceLROnPlateau(
+            self.opt_g, mode='min', factor=0.5, patience=10, min_lr=1e-6
+        )
+        self.scheduler_d = optim.lr_scheduler.ReduceLROnPlateau(
+            self.opt_d, mode='min', factor=0.5, patience=10, min_lr=1e-6
+        )
 
         # Mixed precision
         self.scaler = torch.amp.GradScaler(enabled=self.config.use_mixed_precision)
 
-        # Check generator parameters
-        logger.info("Generator parameter checks:")
-        for name, param in self.generator.named_parameters():
-            logger.info(f"{name}: requires_grad={param.requires_grad}")
-
-        logger.info(f"Models initialized on {self.device}")
-
-    def wasserstein_loss(self, real_pred, fake_pred):
-        """Standard Wasserstein loss"""
-        return fake_pred.mean() - real_pred.mean()
-
     def gradient_penalty(self, real_data, fake_data, labels=None):
-        """Improved gradient penalty calculation"""
+        """Calculate gradient penalty for WGAN-GP"""
         batch_size = real_data.size(0)
-
-        # Create random interpolation factors for each sample in the batch
         alpha = torch.rand(batch_size, 1, device=self.device)
 
         # Interpolate between real and fake data
         interpolates = alpha * real_data + (1 - alpha) * fake_data
         interpolates.requires_grad_(True)
 
-        # Calculate discriminator output for interpolated data
+        # Discriminator output
         if labels is not None:
-            disc_interpolates = self.discriminator(interpolates, labels)
+            disc_interpolates = self.discriminator(interpolates, labels)[0]
         else:
-            disc_interpolates = self.discriminator(interpolates)
+            disc_interpolates = self.discriminator(interpolates)[0]
 
-        # Extract the output if the discriminator returns a tuple
-        if isinstance(disc_interpolates, tuple):
-            disc_interpolates = disc_interpolates[0]
-
-        # Create gradient outputs
-        grad_outputs = torch.ones_like(disc_interpolates, device=self.device, requires_grad=False)
-
-        # Calculate gradients with respect to inputs
+        # Calculate gradients
         gradients = torch.autograd.grad(
             outputs=disc_interpolates,
             inputs=interpolates,
-            grad_outputs=grad_outputs,
+            grad_outputs=torch.ones_like(disc_interpolates, device=self.device),
             create_graph=True,
             retain_graph=True,
             only_inputs=True
         )[0]
 
-        # Reshape and calculate gradient norm
+        # Calculate penalty
         gradients = gradients.view(batch_size, -1)
         gradient_norm = torch.sqrt(torch.sum(gradients ** 2, dim=1) + 1e-12)
+        penalty = ((gradient_norm - 1) ** 2).mean()
 
-        # Calculate and return penalty
-        gradient_penalty = ((gradient_norm - 1) ** 2).mean()
-        return gradient_penalty * self.config.gp_weight
+        return penalty * self.config.gp_weight
 
-    def feature_matching_loss(self, real_features, fake_features):
-        """Feature matching loss to help prevent mode collapse"""
-        # Calculate mean across batch dimension for each feature
-        real_mean = real_features.mean(0)
-        fake_mean = fake_features.mean(0)
+    def train_step(self, real_num, real_cat, epoch, batch_idx):
+        """Ultra-stable WGAN training step"""
+        # 1. CUDA initialization and input validation
+        torch.cuda.empty_cache()
+        torch.zeros(1).to(self.device)  # Ensure CUDA context
 
-        # Mean squared error between feature means
-        return F.mse_loss(fake_mean, real_mean) * 10.0  # Scale the loss appropriately
+        if not torch.isfinite(real_num).all():
+            logger.error("Non-finite values in real data")
+            return None
 
-    def train_step(self, real_num, real_cat, epoch, progress):
-        """Single training step with improved stability measures"""
+        real_num = real_num.to(self.device)
+        real_cat = real_cat.to(self.device) if real_cat is not None else None
         batch_size = real_num.size(0)
 
-        # Move data to device
-        real_num = real_num.to(self.device)
-        if real_cat is not None:
-            real_cat = real_cat.to(self.device)
+        # 2. Conservative noise generation
+        noise = torch.randn(batch_size, self.config.latent_dim,
+                            device=self.device) * 0.05  # Reduced noise scale
 
-        # Calculate global step (total batches processed across all epochs)
-        global_step = epoch * len(self.loader) + progress
+        # 3. Discriminator Update - Simplified
+        self.opt_d.zero_grad(set_to_none=True)
 
-        # ---------------------
-        # Train Discriminator
-        # ---------------------
-        self.opt_d.zero_grad()
+        # Generator with strict output constraints
+        with torch.no_grad():
+            fake_num = torch.clamp(self.generator(noise, real_cat), -3.0, 3.0)
 
-        # Get random noise and generate fake data
-        noise = torch.randn(batch_size, self.config.latent_dim, device=self.device)
-        fake_num = self.generator(noise, real_cat)
+        # Basic discriminator forward
+        d_real = self.discriminator(real_num, real_cat)[0]
+        d_fake = self.discriminator(fake_num, real_cat)[0]
 
-        # Add small noise to real and fake data for stability
-        real_num_noise = real_num + torch.randn_like(real_num) * 0.01
-        fake_num_noise = fake_num + torch.randn_like(fake_num) * 0.01
+        # Stabilized loss calculation
+        wasserstein_loss = torch.clamp(d_fake.mean() - d_real.mean(), -1.0, 1.0)
+        gp = self._ultra_safe_gradient_penalty(real_num, fake_num, real_cat)
+        d_loss = wasserstein_loss + gp * min(2.0, self.config.gp_weight * 0.1)  # Reduced GP
 
-        # Calculate discriminator outputs
-        if self.config.feature_matching:
-            d_real, real_features = self.discriminator(real_num_noise, real_cat)
-            d_fake, fake_features = self.discriminator(fake_num_noise.detach(), real_cat)
-        else:
-            d_real = self.discriminator(real_num_noise, real_cat)
-            d_fake = self.discriminator(fake_num_noise.detach(), real_cat)
-
-        # Wasserstein discriminator loss
-        loss_d = self.wasserstein_loss(d_real, d_fake)
-
-        # Gradient penalty
-        gp = self.gradient_penalty(real_num_noise, fake_num_noise.detach(), real_cat)
-
-        # Total discriminator loss
-        d_loss = loss_d + gp
-
-        # Backward and optimize
+        # Manual gradient handling
         d_loss.backward()
 
-        # Gradient clipping for discriminator
-        torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), 1.0)
-
+        # Extreme gradient clipping
         d_grad_norm = torch.nn.utils.clip_grad_norm_(
             self.discriminator.parameters(),
-            max_norm=self.config.clip_value
+            max_norm=0.1,  # Very conservative
+            norm_type=2.0
         )
+
+        if not torch.isfinite(d_grad_norm) or d_grad_norm > 100:
+            logger.warning(f"Discriminator gradient failure: {d_grad_norm}")
+            self.opt_d.zero_grad(set_to_none=True)
+            return None
+
         self.opt_d.step()
 
-        # ---------------------
-        # Train Generator
-        # ---------------------
-        # Determine if this step should update the generator (every n_critic steps)
-        generator_update = (global_step % self.config.n_critic == 0)
+        # 4. Generator Update - Conservative
+        g_metrics = {'g_loss': 0.0, 'g_grad': 0.0}
 
-        # Initialize generator metrics
-        g_loss = torch.tensor(0.0, device=self.device)
-        total_g_loss = torch.tensor(0.0, device=self.device)
-        g_grad_norm = torch.tensor(0.0, device=self.device)
-        fm_loss = torch.tensor(0.0, device=self.device)
+        if batch_idx % max(5, self.config.n_critic) == 0:  # Fewer updates
+            self.opt_g.zero_grad(set_to_none=True)
 
-        if generator_update:
-            self.opt_g.zero_grad()
+            new_noise = torch.randn(batch_size, self.config.latent_dim,
+                                    device=self.device) * 0.05
 
-            # Generate new fake data for generator update
-            noise = torch.randn(batch_size, self.config.latent_dim, device=self.device)
-            fake_num = self.generator(noise, real_cat)
+            fake_num = self.generator(new_noise, real_cat)
+            fake_num = torch.clamp(fake_num, -3.0, 3.0)
+            d_fake = self.discriminator(fake_num, real_cat)[0]
 
-            if torch.isnan(fake_num).any():
-                logger.error("NaN detected in generator output!")
-                logger.error(f"NaN positions: {torch.isnan(fake_num).nonzero()}")
-                fake_num = torch.nan_to_num(fake_num, nan=0.0)
-
-            # Get discriminator predictions for generator loss
-            if self.config.feature_matching:
-                g_fake, fake_features = self.discriminator(fake_num, real_cat)
-                _, real_features = self.discriminator(real_num, real_cat)
-                # Add feature matching loss
-                fm_loss = self.feature_matching_loss(real_features, fake_features)
-            else:
-                g_fake = self.discriminator(fake_num, real_cat)
-                fm_loss = torch.tensor(0.0, device=self.device)
-
-            # Standard generator loss (minimize -D(G(z)))
-            g_loss = -g_fake.mean()
-
-            # Total generator loss with physics constraints and feature matching
-            total_g_loss = g_loss + fm_loss
-
-            # Check for gradients
-            if total_g_loss.grad_fn is None:
-                logger.error("Generator has no gradients! Check architecture")
-                logger.error(f"g_fake grad_fn: {g_fake.grad_fn}")
-                logger.error(f"fake_num grad_fn: {fake_num.grad_fn}")
-                logger.warning(f"fake_num requires_grad: {fake_num.requires_grad}")
-                logger.warning(f"generator parameters require grad: {any(p.requires_grad for p in self.generator.parameters())}")
-
-            # Backward and optimize
-            total_g_loss.backward()
-
-            # Gradient clipping for generator
-            torch.nn.utils.clip_grad_norm_(self.generator.parameters(), 1.0)
+            # Very conservative generator loss
+            g_loss = -d_fake.mean() * 0.2  # Reduced impact
+            g_loss.backward()
 
             g_grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.generator.parameters(),
-                max_norm=self.config.clip_value
+                max_norm=0.5,
+                norm_type=2.0
             )
-            self.opt_g.step()
+
+            if not torch.isfinite(g_grad_norm):
+                logger.warning("Generator gradient failure")
+                self.opt_g.zero_grad(set_to_none=True)
+            else:
+                self.opt_g.step()
+                g_metrics = {
+                    'g_loss': g_loss.item(),
+                    'g_grad': g_grad_norm.item()
+                }
 
         return {
             'd_loss': d_loss.item(),
-            'g_loss': total_g_loss.item(),
-            'wasserstein': loss_d.item(),
+            'wasserstein': wasserstein_loss.item(),
             'gp': gp.item(),
-            'feature_matching': fm_loss.item() if isinstance(fm_loss, torch.Tensor) else 0.0,
             'd_grad': d_grad_norm.item(),
-            'g_grad': g_grad_norm.item() if generator_update else 0.0
+            **g_metrics,
+            'lr_g': self.opt_g.param_groups[0]['lr'],
+            'lr_d': self.opt_d.param_groups[0]['lr']
         }
 
-    def train(self, epochs=None):
-        """Optimized training loop with configurable parameters"""
-        torch.autograd.set_detect_anomaly(True)
-        try:
-            if epochs is None:
-                epochs = self.config.max_epochs
+    def _ultra_safe_gradient_penalty(self, real_data, fake_data, labels=None):
+        """Bulletproof gradient penalty calculation"""
+        batch_size = real_data.size(0)
 
-            # Calculate total batches per epoch
-            total_batches = len(self.loader)
-            logger.info(f"Starting training with {total_batches} batches per epoch")
+        # Conservative interpolation
+        alpha = torch.rand(batch_size, 1, device=self.device, requires_grad=False)
+        interpolates = (alpha * real_data + (1 - alpha) * fake_data).requires_grad_(True)
 
-            # Training metrics tracking
-            metrics_history = {
-                'g_loss': [],
-                'd_loss': [],
-                'wasserstein': [],
-                'gp': [],
-                'feature_matching': [],
-                'd_grad': [],
-                'g_grad': []
+        # Simple discriminator output
+        if labels is not None:
+            d_interpolates = self.discriminator(interpolates, labels)[0]
+        else:
+            d_interpolates = self.discriminator(interpolates)[0]
+
+        # Manual gradient calculation
+        gradients = torch.autograd.grad(
+            outputs=d_interpolates.sum(),  # Sum reduces instability
+            inputs=interpolates,
+            create_graph=False,  # Safer
+            retain_graph=True,
+            only_inputs=True
+        )[0]
+
+        # Extreme gradient stabilization
+        gradients = gradients.view(batch_size, -1)
+        gradients = torch.clamp(gradients, -1e2, 1e2)  # Hard clipping
+        grad_norm = torch.sqrt(torch.sum(gradients ** 2, dim=1) + 1e-8)
+
+        # Conservative penalty
+        penalty = ((grad_norm - 1.0).clamp(-10.0, 10.0) ** 2).mean()
+        return torch.clamp(penalty, 0.0, 5.0)
+
+    def train_loop(self, epochs=None):
+        """Robust training loop with advanced recovery mechanisms"""
+        # Initialize CUDA and models
+        torch.cuda.empty_cache()
+        torch.zeros(1).to(self.device)
+
+        if epochs is None:
+            epochs = self.config.max_epochs
+
+        # Training header with config summary
+        logger.info("\n=== Stabilized WGAN Training ===")
+        logger.info(f"Device: {self.device} | Batch size: {self.config.batch_size}")
+        logger.info(f"GP Weight: {self.config.gp_weight} | LR: {self.config.g_lr}/{self.config.d_lr}")
+        logger.info("-" * 60)
+
+        self._best_loss = float('inf')
+        self._no_improve = 0
+
+        for epoch in range(epochs):
+            epoch_metrics = {
+                'g_loss': [], 'd_loss': [],
+                'wasserstein': [], 'gp': [],
+                'g_grad': [], 'd_grad': []
             }
+            valid_batches = 0
 
-            # Early stopping variables
-            best_loss = float('inf')
-            no_improve_epochs = 0
+            self.generator.train()
+            self.discriminator.train()
 
-            for epoch in range(epochs):
-                epoch_metrics = {key: 0.0 for key in metrics_history}
-                epoch_batches = 0
-                start_time = time.time()
-                generator_updates = 0  # Track generator updates
+            for batch_idx, data in enumerate(self.loader):
+                try:
+                    # Get batch data with validation
+                    real_num = data[0].to(self.device)
+                    real_cat = data[1].to(self.device) if len(data) > 1 else None
 
-                # Set models to training mode
-                self.generator.train()
-                self.discriminator.train()
-
-                for batch_idx, data in enumerate(self.loader):
-                    # Data handling - either tuple of (num, cat) or just num
-                    if len(data) == 2:
-                        real_num, real_cat = data
-                    else:
-                        real_num = data[0]
-                        real_cat = None
-
-                    # Skip small batches
                     if real_num.size(0) < 2:
                         continue
 
-                    # Execute training step
-                    step_metrics = self.train_step(real_num, real_cat, epoch, batch_idx)
+                    # Training step with recovery
+                    metrics = self.train_step(real_num, real_cat, epoch, batch_idx)
+                    if metrics is None:
+                        self._recover_from_failure()
+                        continue
 
-                    # Check if generator was updated (non-zero g_grad indicates an update)
-                    if step_metrics['g_grad'] > 0:
-                        generator_updates += 1
+                    # Track metrics
+                    valid_batches += 1
+                    for k, v in metrics.items():
+                        if k in epoch_metrics:
+                            epoch_metrics[k].append(v)
 
-                    # Update epoch metrics
-                    for key in step_metrics:
-                        epoch_metrics[key] += step_metrics[key]
-                    epoch_batches += 1
-
-                    # Logging (reduced frequency)
-                    if batch_idx % 20 == 0 or batch_idx == total_batches - 1:
-                        # Format loss info
-                        log_str = (
-                            f"Epoch {epoch + 1}/{epochs} Batch {batch_idx}/{total_batches} | "
-                            f"G Loss: {step_metrics['g_loss']:.4f} | "
-                            f"D Loss: {step_metrics['d_loss']:.4f} | "
-                            f"G Grad: {step_metrics['g_grad']:.2f} | "
-                            f"D Grad: {step_metrics['d_grad']:.2f} | "
-                            f"W-dist: {-step_metrics['wasserstein']:.4f}"
+                    # Enhanced logging
+                    if batch_idx % 10 == 0:
+                        logger.info(
+                            f"Epoch {epoch + 1}/{epochs} | Batch {batch_idx} | "
+                            f"G: {metrics['g_loss']:.3f} (grad:{metrics['g_grad']:.1f}) | "
+                            f"D: {metrics['d_loss']:.3f} (grad:{metrics['d_grad']:.1f}) | "
+                            f"W: {-metrics['wasserstein']:.3f} | GP: {metrics['gp']:.2f}"
                         )
-                        logger.info(log_str)
 
-                    # Check for NaN values and stop if needed
-                    if any(torch.isnan(torch.tensor(v)) or torch.isinf(torch.tensor(v))
-                           for k, v in step_metrics.items() if k.endswith('loss')):
-                        logger.warning("NaN or Inf detected in loss values. Stopping training.")
-                        return metrics_history
+                except Exception as e:
+                    logger.error(f"Batch failed: {str(e)}")
+                    self._recover_from_failure()
+                    continue
 
-                # Epoch completion - calculate averages
-                if epoch_batches > 0:
-                    for key in epoch_metrics:
-                        epoch_metrics[key] /= epoch_batches
-                        metrics_history[key].append(epoch_metrics[key])
+            # Epoch validation
+            if valid_batches == 0:
+                logger.error("Epoch failed - no valid batches")
+                break
 
-                # Calculate epoch time
-                epoch_time = time.time() - start_time
+            # Calculate epoch averages
+            epoch_avg = {k: np.mean(v) for k, v in epoch_metrics.items()}
 
-                # Logging for epoch completion
-                logger.info(
-                    f"Epoch {epoch + 1}/{epochs} Complete | "
-                    f"Time: {epoch_time:.2f}s | "
-                    f"Avg G Loss: {epoch_metrics['g_loss']:.4f} | "
-                    f"Avg D Loss: {epoch_metrics['d_loss']:.4f} | "
-                    f"Avg W-dist: {-epoch_metrics['wasserstein']:.4f} | "
-                    f"Generator Updates: {generator_updates}/{epoch_batches} ({generator_updates / epoch_batches * 100:.1f}%)"
-                )
+            # Update history and learning rates
+            for k, v in epoch_avg.items():
+                self.history[k].append(v)
 
-                # Evaluate generator quality
-                if (epoch + 1) % 5 == 0:
-                    self._evaluate_generator(epoch + 1)
+            self._update_learning_rates(epoch_avg['g_loss'], epoch_avg['d_loss'])
 
-                # Learning rate scheduling
-                if self.config.scheduler_type == 'cosine':
-                    self.scheduler_g.step()
-                    self.scheduler_d.step()
+            # Early stopping and progress
+            if self._check_early_stopping(epoch_avg, epoch):
+                break
 
-                    # Log new learning rates
-                    new_lr_g = self.scheduler_g.get_last_lr()[0]
-                    new_lr_d = self.scheduler_d.get_last_lr()[0]
-                    logger.info(f"Learning rates: G={new_lr_g:.2e}, D={new_lr_d:.2e}")
+            # Periodic evaluation
+            if (epoch + 1) % 5 == 0:
+                self._evaluate_progress(epoch + 1)
 
-                elif self.config.scheduler_type == 'reduce':
-                    # Use average losses to step schedulers
-                    self.scheduler_g.step(epoch_metrics['g_loss'])
-                    self.scheduler_d.step(epoch_metrics['d_loss'])
+        return self.history
 
-                else:  # Step scheduler
-                    self.scheduler_g.step()
-                    self.scheduler_d.step()
+    def _recover_from_failure(self):
+        """Simplified recovery without scaler update"""
+        self.opt_g.zero_grad(set_to_none=True)
+        self.opt_d.zero_grad(set_to_none=True)
 
-                # Early stopping check
-                current_loss = epoch_metrics['g_loss']
-                if current_loss < best_loss * 0.99:  # 1% improvement
-                    best_loss = current_loss
-                    no_improve_epochs = 0
-                else:
-                    no_improve_epochs += 1
-                    if no_improve_epochs >= self.config.patience:
-                        logger.info(f"Early stopping after {epoch + 1} epochs without improvement")
-                        break
+        # Reduce learning rates
+        for param_group in self.opt_g.param_groups:
+            param_group['lr'] *= 0.9
+        for param_group in self.opt_d.param_groups:
+            param_group['lr'] *= 0.9
 
-                # Check other stopping conditions
-                if self._check_early_stopping(metrics_history, epoch):
-                    break
+        torch.cuda.empty_cache()
 
-            return metrics_history
-        finally:
-            # Disable anomaly detection when done
-            torch.autograd.set_detect_anomaly(False)
+    def _update_learning_rates(self, g_loss, d_loss):
+        """Adaptive learning rate adjustment"""
+        # Generator LR update
+        if g_loss < 0.1:  # Too small loss
+            for param_group in self.opt_g.param_groups:
+                param_group['lr'] *= 0.98
 
-    def _evaluate_generator(self, epoch):
-        """Evaluate generator quality with some basic metrics"""
-        # Generate a small batch of samples
-        n_samples = 500
-        self.generator.eval()
+        # Discriminator LR update
+        if d_loss > 5.0:  # Too large loss
+            for param_group in self.opt_d.param_groups:
+                param_group['lr'] *= 0.9
+        elif d_loss < 0.5:  # Too small loss
+            for param_group in self.opt_d.param_groups:
+                param_group['lr'] *= 1.02  # Slight increase
 
-        with torch.no_grad():
-            noise = torch.randn(n_samples, self.config.latent_dim, device=self.device)
+    def _check_early_stopping(self, metrics, epoch):
+        """Enhanced early stopping criteria with proper state tracking"""
+        # Initialize tracking variables if they don't exist
+        if not hasattr(self, '_best_loss'):
+            self._best_loss = float('inf')
+        if not hasattr(self, '_no_improve'):
+            self._no_improve = 0
 
-            # Sample random categorical data if needed
-            if self.num_categorical > 0 and self.X_cat is not None:
-                idx = torch.randint(0, len(self.X_cat), (n_samples,))
-                cat_samples = self.X_cat[idx].to(self.device)
-            else:
-                cat_samples = None
-
-            # Generate samples
-            fake_num = self.generator(noise, cat_samples)
-
-            # Move to CPU for evaluation
-            fake_num = fake_num.cpu().numpy()
-
-            # Calculate some basic stats for a few columns
-            for i, col in enumerate(self.numerical_cols[:min(3, len(self.numerical_cols))]):
-                col_data = fake_num[:, i]
-                logger.info(
-                    f"Column {col}: "
-                    f"Mean={np.mean(col_data):.4f}, "
-                    f"Std={np.std(col_data):.4f}, "
-                    f"Min={np.min(col_data):.4f}, "
-                    f"Max={np.max(col_data):.4f}"
-                )
-
-            for name, param in self.generator.named_parameters():
-                if 'weight_v' in name:  # Spectral norm parameters
-                    logger.info(f"Spectral norm {name}: {param.data.mean().item():.4f}")
-
-        self.generator.train()
-
-    def _check_early_stopping(self, history, epoch):
-        """Check for early stopping conditions"""
-        if epoch < self.config.patience:
-            return False
-
-        # Check for NaN/inf
-        if np.isnan(history['g_loss'][-1]) or np.isinf(history['g_loss'][-1]):
-            logger.warning("NaN/Inf detected, stopping training")
+        # Check for NaN/inf first
+        if any(not math.isfinite(v) for v in metrics.values()):
+            logger.error("Non-finite metrics detected, stopping training")
             return True
 
-        # Check loss divergence - stop if losses are too high
-        if history['d_loss'][-1] < -200 or history['g_loss'][-1] > 200:
-            logger.warning("Loss divergence detected, stopping training")
+        # Check for loss divergence
+        if metrics['d_loss'] > 100 or metrics['g_loss'] > 100:
+            logger.error("Loss divergence detected (D: %.2f, G: %.2f), stopping",
+                         metrics['d_loss'], metrics['g_loss'])
+            return True
+
+        # Normal early stopping logic
+        if metrics['g_loss'] < self._best_loss * 0.99:  # 1% improvement
+            logger.info("Improvement detected (%.4f -> %.4f)",
+                        self._best_loss, metrics['g_loss'])
+            self._best_loss = metrics['g_loss']
+            self._no_improve = 0
+        else:
+            self._no_improve += 1
+            if self._no_improve >= self.config.patience:
+                logger.info("Early stopping at epoch %d - no improvement for %d epochs",
+                            epoch + 1, self._no_improve)
+                return True
+
+        # Additional stopping criteria
+        if -metrics['wasserstein'] < 0.001:  # Wasserstein distance too small
+            logger.info("Stopping - Wasserstein distance converged (%.4f)",
+                        -metrics['wasserstein'])
             return True
 
         return False
 
     def generate(self, n_samples):
-        """Generate synthetic samples with enhanced post-processing"""
+        """Generate synthetic samples"""
         self.generator.eval()
 
         with torch.no_grad():
-            # Process in smaller batches for memory efficiency
-            batch_size = min(n_samples, 512)
-            all_synthetic_num = []
+            # Generate in batches
+            batch_size = min(512, n_samples)
+            synthetic_num = []
 
-            # Generate batches
             for i in range(0, n_samples, batch_size):
-                current_batch_size = min(batch_size, n_samples - i)
+                current_batch = min(batch_size, n_samples - i)
 
-                # Generate noise with a bit of structure to prevent mode collapse
-                noise = torch.randn(current_batch_size, self.config.latent_dim, device=self.device)
-
-                # Add some structure to noise (optional)
-                if current_batch_size > 1:
-                    # Add slight correlation to help with diversity
-                    corr_factor = 0.1
-                    shared_noise = torch.randn(1, self.config.latent_dim, device=self.device)
-                    noise = noise * (1 - corr_factor) + shared_noise * corr_factor
+                # Generate noise
+                noise = torch.randn(current_batch, self.config.latent_dim, device=self.device)
 
                 # Sample categorical data if needed
                 if self.num_categorical > 0 and self.X_cat is not None:
-                    # Sample with replacement from real categorical data
-                    idx = torch.randint(0, len(self.X_cat), (current_batch_size,))
+                    idx = torch.randint(0, len(self.X_cat), (current_batch,))
                     cat_samples = self.X_cat[idx].to(self.device)
                 else:
                     cat_samples = None
 
-                # Generate synthetic numerical data
-                synthetic_num = self.generator(noise, cat_samples)
+                # Generate numerical data
+                batch_num = self.generator(noise, cat_samples)
+                synthetic_num.append(batch_num.cpu().numpy())
 
-                # Add to collection
-                all_synthetic_num.append(synthetic_num.cpu().numpy())
+            # Combine batches
+            synthetic_num = np.vstack(synthetic_num)
 
-            # Combine all batches
-            synthetic_num = np.vstack(all_synthetic_num)
-
-            # After generating synthetic_num, add validation
-            logger.info(f"Generated synthetic data shape: {synthetic_num.shape}")
-            logger.info(f"Column means: {np.nanmean(synthetic_num, axis=0)}")
-
-            # Create dataframe with numerical columns
+            # Inverse transform numerical data
             if 'num' in self.preprocessor.named_transformers_:
-                # Inverse transform numerical data
-                num_pipeline = self.preprocessor.named_transformers_['num']
+                synthetic_num = np.clip(synthetic_num, -5, 5)  # Prevent extreme values
+                inverted_num = self.preprocessor.named_transformers_['num'].inverse_transform(synthetic_num)
 
-                # Clip extreme values before inverse transform
-                synthetic_num = np.clip(synthetic_num, -5, 5)
+                # Apply range constraints
+                for i, col in enumerate(self.numerical_cols):
+                    if col in self.num_ranges:
+                        min_val, max_val = self.num_ranges[col]
+                        if min_val is not None:
+                            inverted_num[:, i] = np.maximum(inverted_num[:, i], min_val)
+                        if max_val is not None:
+                            inverted_num[:, i] = np.minimum(inverted_num[:, i], max_val)
 
-                try:
-                    inverted_num_data = num_pipeline.inverse_transform(synthetic_num)
-
-                    # Handle any remaining invalid values
-                    inverted_num_data = np.nan_to_num(inverted_num_data, nan=0.0, posinf=0.0, neginf=0.0)
-
-                    # Apply final range constraints
-                    for i, col in enumerate(self.numerical_cols):
-                        if col in self.num_ranges:
-                            min_val, max_val = self.num_ranges[col]
-                            if min_val is not None:
-                                inverted_num_data[:, i] = np.maximum(inverted_num_data[:, i], min_val)
-                            if max_val is not None:
-                                inverted_num_data[:, i] = np.minimum(inverted_num_data[:, i], max_val)
-
-                    synthetic_df = pd.DataFrame(inverted_num_data, columns=self.numerical_cols)
-                except Exception as e:
-                    logger.error(f"Inverse transform failed: {str(e)}")
-                    logger.error(f"Input stats - min: {np.min(synthetic_num)}, max: {np.max(synthetic_num)}")
-                    logger.error(f"NaN count: {np.isnan(synthetic_num).sum()}")
-                    raise
+                synthetic_df = pd.DataFrame(inverted_num, columns=self.numerical_cols)
             else:
                 synthetic_df = pd.DataFrame(columns=self.numerical_cols)
 
-            # Handle categorical data
-            if self.num_categorical > 0 and self.X_cat is not None and 'cat' in self.preprocessor.named_transformers_:
-                # Sample categorical data using frequency-based approach
-                synthetic_cat = self._generate_categorical_data(n_samples)
+            # Add categorical data
+            if self.num_categorical > 0 and 'cat' in self.preprocessor.named_transformers_:
+                cat_encoder = self.preprocessor.named_transformers_['cat'].named_steps['onehot']
 
-                for col, values in synthetic_cat.items():
-                    synthetic_df[col] = values
+                for i, col in enumerate(self.categorical_cols):
+                    # Sample categories based on original distribution
+                    categories = cat_encoder.categories_[i]
+                    value_counts = self.real_data[col].value_counts(normalize=True)
+                    probs = [value_counts.get(cat, 0) for cat in categories]
+                    synthetic_df[col] = np.random.choice(categories, size=n_samples, p=probs)
 
-            # Add validation checks (Post-generation validation)
-            for col in self.numerical_cols:
-                if col in synthetic_df.columns:
-                    nan_count = synthetic_df[col].isna().sum()
-                    if nan_count > 0:
-                        logger.warning(f"Column {col} has {nan_count} NaN values - filling with median")
-                        synthetic_df[col] = synthetic_df[col].fillna(synthetic_df[col].median())
-
-            # Add boolean columns with proper distribution
+            # Add boolean columns
             for col in self.boolean_cols:
                 if col in self.bool_distributions:
-                    true_prob = self.bool_distributions[col]
-                    synthetic_df[col] = np.random.random(n_samples) < true_prob
+                    synthetic_df[col] = np.random.random(n_samples) < self.bool_distributions[col]
 
-            # Add other fields like dates and strings
+            # Add other field types
             for col, meta in self.metadata.items():
                 if col in synthetic_df.columns:
                     continue
@@ -943,88 +690,64 @@ class WGAN:
                 elif meta.data_type == DataType.STRING:
                     synthetic_df[col] = self._generate_string_column(meta, n_samples)
 
-            # Apply final consistency checks
-            synthetic_df = self._post_process(synthetic_df)
-
             return synthetic_df
 
-    def _generate_categorical_data(self, n_samples):
-        """Generate categorical data preserving distributions from original data"""
-        synthetic_cat = {}
+    def _evaluate_progress(self, epoch):
+        """Evaluation method that matches your training loop"""
+        try:
+            # Generate sample data
+            with torch.no_grad():
+                samples = self.generate(100)
 
-        if 'cat' not in self.preprocessor.named_transformers_:
-            return synthetic_cat
+            # Log basic statistics
+            logger.info(f"\nEpoch {epoch} Evaluation:")
 
-        cat_encoder = self.preprocessor.named_transformers_['cat'].named_steps['onehot']
+            # Numerical columns
+            num_cols = [col for col in samples.columns
+                        if col in self.numerical_cols][:3]  # First 3 cols
+            for col in num_cols:
+                logger.info(
+                    f"{col:<15}: mean={samples[col].mean():>8.3f} | "
+                    f"std={samples[col].std():>7.3f} | "
+                    f"min={samples[col].min():>7.3f} | "
+                    f"max={samples[col].max():>7.3f}"
+                )
 
-        # Process each categorical column
-        for i, col in enumerate(self.categorical_cols):
-            # Get original categories and their frequencies
-            categories = cat_encoder.categories_[i]
+            # Categorical columns
+            cat_cols = [col for col in samples.columns
+                        if col in self.categorical_cols][:2]  # First 2 cols
+            for col in cat_cols:
+                counts = samples[col].value_counts(normalize=True)
+                logger.info(f"{col:<15}: " + " | ".join(
+                    f"{k}: {v:.2%}" for k, v in counts.iloc[:3].items()
+                ) + ("..." if len(counts) > 3 else ""))
 
-            # Count occurrences in original data
-            col_idx = self.real_data.columns.get_loc(col)
-            value_counts = self.real_data.iloc[:, col_idx].value_counts(normalize=True)
+        except Exception as e:
+            logger.error(f"Evaluation failed: {str(e)}")
 
-            # Generate values based on frequencies
-            synthetic_values = np.random.choice(
-                categories,
-                size=n_samples,
-                p=[value_counts.get(cat, 0) for cat in categories]
-            )
-
-            synthetic_cat[col] = synthetic_values
-
-        return synthetic_cat
+    def _evaluate_generator(self, epoch):
+        """Evaluate generator quality"""
+        samples = self.generate(100)
+        logger.info(f"Epoch {epoch} sample stats:")
+        for col in samples.columns[:3]:  # Show first 3 columns
+            logger.info(f"{col}: mean={samples[col].mean():.4f}, std={samples[col].std():.4f}")
 
     def _generate_datetime_column(self, col, n_samples):
-        """Generate datetime column with realistic distribution"""
-        if col not in self.real_data.columns:
-            # Default date range if column not in original data
-            return pd.date_range(
-                start='2020-01-01',
-                end='2023-01-01',
-                periods=n_samples
-            )
-
-        # Get min and max dates from original data
-        min_date = self.real_data[col].min()
-        max_date = self.real_data[col].max()
-
-        # Calculate date range in seconds
-        min_ts = min_date.timestamp()
-        max_ts = max_date.timestamp()
-
-        # Generate timestamps with slight preference for recent dates
-        alpha, beta = 2, 5  # Beta distribution shape parameters
-        rand_values = np.random.beta(alpha, beta, n_samples)
-        timestamps = min_ts + rand_values * (max_ts - min_ts)
-
-        # Convert to datetime
-        return pd.to_datetime(timestamps, unit='s')
+        """Generate datetime column"""
+        if col in self.real_data.columns:
+            min_date = self.real_data[col].min()
+            max_date = self.real_data[col].max()
+            delta = max_date - min_date
+            return [min_date + delta * np.random.random() for _ in range(n_samples)]
+        else:
+            return pd.date_range('2020-01-01', periods=n_samples, freq='D')
 
     def _generate_string_column(self, meta, n_samples):
-        """Generate string column based on metadata"""
+        """Generate string column"""
         if meta.fake_strategy:
-            # Use specified faker strategy
             if meta.string_format:
                 return [getattr(self.faker, meta.fake_strategy)(meta.string_format) for _ in range(n_samples)]
-            else:
-                return [getattr(self.faker, meta.fake_strategy)() for _ in range(n_samples)]
+            return [getattr(self.faker, meta.fake_strategy)() for _ in range(n_samples)]
         elif meta.custom_faker:
-            # Use custom faker function
             return [meta.custom_faker() for _ in range(n_samples)]
-        else:
-            # Default to email if no strategy specified
-            return [self.faker.email() for _ in range(n_samples)]
-
-    def _post_process(self, df):
-        """Apply final post-processing to ensure constraints are met"""
-        # Apply range constraints
-        for col, (min_val, max_val) in self.num_ranges.items():
-            if col in df.columns:
-                if min_val is not None:
-                    df[col] = np.maximum(df[col], min_val)
-                if max_val is not None:
-                    df[col] = np.minimum(df[col], max_val)
-        return df
+        return [self.faker.email() for _ in range(n_samples)]

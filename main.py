@@ -114,10 +114,10 @@ class DataGenerator:
             metadata: Dict[str, FieldMetadata],
             method: MethodType = MethodType.WGAN,
             synthetic_size: Optional[int] = None,
-            epochs: int = 10
+            epochs: int = 50
     ) -> pd.DataFrame:
         """Generate synthetic data using specified method"""
-        synthetic_size = synthetic_size or len(real_data) // 5
+        synthetic_size = synthetic_size or len(real_data) // 2
 
         logger.info(f"Generating {synthetic_size} synthetic samples using {method.value}")
 
@@ -131,7 +131,7 @@ class DataGenerator:
                 metadata=metadata,
                 config=gan_config
             )
-            generator.train(epochs=epochs)
+            generator.train_loop(epochs=epochs)
             synthetic_data = generator.generate(synthetic_size)
         else:
             raise ValueError(f"Unsupported method: {method}")
