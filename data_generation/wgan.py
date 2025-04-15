@@ -994,6 +994,32 @@ class WGAN:
                     else:
                         synthetic_df[col] = None
 
+                # Ensure all metadata columns exist
+                for col, meta in self.metadata.items():
+                    if col not in synthetic_df.columns:
+                        if meta.data_type == DataType.STRING and meta.faker_method:
+                            synthetic_df[col] = [meta.faker_method(**meta.faker_args) for _ in range(n_samples)]
+                        elif meta.data_type == DataType.DATETIME:
+                            synthetic_df[col] = self._generate_datetime_column(col, n_samples)
+                        elif meta.data_type == DataType.BOOLEAN:
+                            synthetic_df[col] = np.random.random(n_samples) < 0.5
+                        elif meta.data_type == DataType.CATEGORICAL:
+                            # Get categories from real data or use default
+                            if col in self.real_data.columns:
+                                categories = self.real_data[col].dropna().unique()
+                                if len(categories) > 0:
+                                    synthetic_df[col] = np.random.choice(categories, size=n_samples)
+                                else:
+                                    synthetic_df[col] = ['category_' + str(i) for i in range(n_samples)]
+                            else:
+                                synthetic_df[col] = ['category_' + str(i) for i in range(n_samples)]
+                        else:
+                            # For numerical columns, use mean or random values
+                            if meta.min_value is not None and meta.max_value is not None:
+                                synthetic_df[col] = np.random.uniform(meta.min_value, meta.max_value, size=n_samples)
+                            else:
+                                synthetic_df[col] = np.random.normal(0, 1, size=n_samples)
+
             return synthetic_df
 
     def _apply_nans(self, series, meta):

@@ -103,9 +103,14 @@ def generate_comparison_report(
         all_columns = set(real_data.columns).union(set(synthetic_data.columns)).union(set(metadata.keys()))
         for col_idx, col in enumerate(all_columns):
             try:
-                if col not in real_data.columns and col not in synthetic_data.columns:
+                if col not in synthetic_data.columns:
                     report_content.append(f"\n=== Column: {col} ===")
-                    report_content.append("Warning: Column missing in both real and synthetic data")
+                    report_content.append(f"Warning: Column missing in synthetic data (Type: {col_type})\n")
+                    continue
+
+                if col not in real_data.columns:
+                    report_content.append(f"\n=== Column: {col} ===")
+                    report_content.append(f"Warning: Column missing in real data (Type: {col_type})\n")
                     continue
 
                 # Memory check
@@ -319,78 +324,62 @@ def _analyze_numerical(col: str, real_data: pd.DataFrame, synthetic_data: pd.Dat
 
 
 def _analyze_categorical(col: str, real_data: pd.DataFrame, synthetic_data: pd.DataFrame, report_path: str) -> List[str]:
-    """Enhanced categorical column analysis"""
     content = []
     fig = None
 
     try:
-        # Handle NaN values
-        real_clean = real_data[col].fillna('missing')
-        synth_clean = synthetic_data[col].fillna('missing')
+        # Handle missing values and ensure string type
+        real_clean = real_data[col].fillna('missing').astype(str)
+        synth_clean = synthetic_data[col].fillna('missing').astype(str)
 
-        # Calculate value counts
-        real_counts = real_clean.value_counts(normalize=True).sort_values(ascending=False)
-        synth_counts = synth_clean.value_counts(normalize=True).sort_values(ascending=False)
+        # Get all unique categories from both datasets
+        all_categories = sorted(list(set(real_clean.unique()).union(set(synth_clean.unique()))))
 
-        if len(real_counts) == 0 or len(synth_counts) == 0:
-            content.append("\nWarning: No valid data for analysis")
-            return content
+        # Create normalized value counts
+        real_counts = real_clean.value_counts(normalize=True).reindex(all_categories, fill_value=0)
+        synth_counts = synth_clean.value_counts(normalize=True).reindex(all_categories, fill_value=0)
 
-        # Statistical tests
-        # Create contingency table
-        all_categories = list(set(real_data[col].unique()).union(set(synthetic_data[col].unique())))
-        contingency = pd.DataFrame({
-            'Real': real_data[col].value_counts().reindex(all_categories, fill_value=0),
-            'Synthetic': synthetic_data[col].value_counts().reindex(all_categories, fill_value=0)
-        }).T
-
-        # Chi-square test
-        chi2, chi2_p, _, _ = chi2_contingency(contingency)
-
-        # Jensen-Shannon divergence
-        js_div = jensenshannon(real_counts, synth_counts)
-
+        # Add basic statistics
         content.append("\nReal Data Value Proportions (Top 10):")
-        for val, prop in real_counts.head(10).items():
+        for val, prop in real_counts.nlargest(10).items():
             content.append(f"{val}: {prop:.4f}")
 
         content.append("\nSynthetic Data Value Proportions (Top 10):")
-        for val, prop in synth_counts.head(10).items():
+        for val, prop in synth_counts.nlargest(10).items():
             content.append(f"{val}: {prop:.4f}")
 
-        content.append("\nStatistical Tests:")
-        content.append(f"Chi-square test: χ²={chi2:.2f}, p={chi2_p:.4f}")
-        content.append(f"Jensen-Shannon Divergence: {js_div:.4f}")
+        # Only perform statistical tests if we have sufficient data
+        if len(all_categories) > 1 and len(real_clean) > 10 and len(synth_clean) > 10:
+            try:
+                # Create contingency table with small pseudo-count to avoid zeros
+                contingency = pd.DataFrame({
+                    'Real': real_clean.value_counts().reindex(all_categories, fill_value=0.5),
+                    'Synthetic': synth_clean.value_counts().reindex(all_categories, fill_value=0.5)
+                }).T.fillna(0.5)
 
-        # Create visualizations
-        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-        fig.suptitle(f'Categorical Analysis: {col}', y=1.02)
+                # Calculate statistical tests
+                chi2, chi2_p, _, _ = chi2_contingency(contingency)
+                js_div = jensenshannon(real_counts, synth_counts)
 
-        # Bar plot of top categories
-        top_n = min(10, len(real_counts))
+                content.append("\nStatistical Tests:")
+                content.append(f"Chi-square test: χ²={chi2:.2f}, p={chi2_p:.4f}")
+                content.append(f"Jensen-Shannon Divergence: {js_div:.4f}")
+            except Exception as e:
+                content.append("\nWarning: Statistical tests failed - " + str(e))
+
+        # Visualization
+        fig, ax = plt.subplots(figsize=(10, 6))
+        top_n = min(10, len(all_categories))
         plot_data = pd.DataFrame({
             'Real': real_counts.head(top_n),
             'Synthetic': synth_counts.reindex(real_counts.head(top_n).index, fill_value=0)
         })
-        plot_data.plot(kind='bar', ax=axes[0])
-        axes[0].set_title(f'Top {top_n} Category Proportions')
-        axes[0].set_ylabel('Proportion')
-        axes[0].tick_params(axis='x', rotation=45)
-
-        # Cumulative distribution
-        cum_real = real_counts.cumsum()
-        cum_synth = synth_counts.reindex(real_counts.index, fill_value=0).cumsum()
-        axes[1].plot(cum_real.values, label='Real', color='blue')
-        axes[1].plot(cum_synth.values, label='Synthetic', color='orange')
-        axes[1].set_title('Cumulative Distribution')
-        axes[1].set_xlabel('Number of Categories')
-        axes[1].set_ylabel('Cumulative Proportion')
-        axes[1].legend()
-        axes[1].grid(True)
-
+        plot_data.plot(kind='bar', ax=ax)
+        ax.set_title(f'Top {top_n} Category Proportions: {col}')
+        ax.set_ylabel('Proportion')
         plt.tight_layout()
         plt.savefig(os.path.join(report_path, f"{col}_categorical_comparison.png"))
-        content.append(f"\nVisualizations saved as: {col}_categorical_comparison.png")
+        content.append(f"\nVisualization saved as: {col}_categorical_comparison.png")
 
     except Exception as e:
         logger.error(f"Error in categorical analysis for {col}: {str(e)}")

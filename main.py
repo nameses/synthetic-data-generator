@@ -35,7 +35,7 @@ class DataGenerator:
                                        datetime_max='31-12-2023 23:59'),
             'cdi': FieldMetadata(DataType.INTEGER, min_value=0, max_value=9),
             'mmi': FieldMetadata(DataType.INTEGER, min_value=1, max_value=10),
-            'alert': FieldMetadata(DataType.CATEGORICAL, allow_nans=True, nan_probability=0.2),
+            'alert': FieldMetadata(DataType.CATEGORICAL, allow_nans=True),
             'tsunami': FieldMetadata(DataType.BOOLEAN),
             'sig': FieldMetadata(DataType.INTEGER, min_value=650, max_value=2910),
             'net': FieldMetadata(DataType.CATEGORICAL),
@@ -47,8 +47,8 @@ class DataGenerator:
             'latitude': FieldMetadata(DataType.DECIMAL, min_value=-61.8, max_value=71.6, decimal_places=4),
             'longitude': FieldMetadata(DataType.DECIMAL, min_value=-180.0, max_value=180.0, decimal_places=3),
             'location': FieldMetadata(DataType.STRING, faker_method=self.faker.city),
-            'continent': FieldMetadata(DataType.CATEGORICAL, allow_nans=True, nan_probability=0.2),
-            'country': FieldMetadata(DataType.STRING, faker_method=self.faker.country, allow_nans=True, nan_probability=0.2)
+            'continent': FieldMetadata(DataType.CATEGORICAL, allow_nans=True),
+            'country': FieldMetadata(DataType.STRING, faker_method=self.faker.country, allow_nans=True)
         }
 
         return {col: meta for col, meta in metadata.items()}
