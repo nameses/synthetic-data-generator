@@ -7,10 +7,10 @@ class DataType(Enum):
     STRING = "string"
     BOOLEAN = "boolean"
     CATEGORICAL = "categorical"
-    DATE_TIME = "time"
+    DATETIME = "datetime"
 
 
 class MethodType(Enum):
     GAN = "gan"
     VAE = "vae"
-    WGAN = "wgan"  # Added WGAN as the preferred method
+    WGAN = "wgan"
