@@ -103,6 +103,9 @@ def generate_comparison_report(
         all_columns = set(real_data.columns).union(set(synthetic_data.columns)).union(set(metadata.keys()))
         for col_idx, col in enumerate(all_columns):
             try:
+                meta = metadata.get(col)
+                col_type = meta.data_type if meta else "unknown"
+
                 if col not in synthetic_data.columns:
                     report_content.append(f"\n=== Column: {col} ===")
                     report_content.append(f"Warning: Column missing in synthetic data (Type: {col_type})\n")
@@ -120,8 +123,7 @@ def generate_comparison_report(
                     gc.collect()
                     mem_threshold = 0.8 * psutil.virtual_memory().available
 
-                meta = metadata.get(col)
-                col_type = meta.data_type if meta else "unknown"
+
 
                 logger.info(f"Processing column {col_idx + 1}/{len(real_data.columns)}: {col} ({col_type})")
 

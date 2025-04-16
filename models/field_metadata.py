@@ -26,7 +26,6 @@ class FieldMetadata:
 
             # NaN handling
             allow_nans: bool = False,
-            nan_probability: float = 0.1,
 
             # datetime fields
             datetime_format: Optional[str] = None,
@@ -40,7 +39,6 @@ class FieldMetadata:
         self.faker_method = faker_method
         self.faker_args = faker_args or {}
         self.allow_nans = allow_nans
-        self.nan_probability = min(max(nan_probability, 0), 1)
         self.datetime_format = datetime_format
         self.datetime_type = self._detect_datetime_type(datetime_format)
         self.datetime_min = datetime_min
