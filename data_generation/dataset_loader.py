@@ -92,8 +92,11 @@ class DatasetLoader:
             sampled_data = full_data.sample(min(sample_size, len(full_data)), random_state=random_state)
 
         # 4. Cleanup and validate
-        sampled_data = sampled_data[full_data.columns.difference(
-            [f"_ord_{c}" for c in date_cols] + [f"_bin_{c}" for c in date_cols + num_cols] + ['_strat_key'])]
+        sampled_data = sampled_data[full_data.columns.difference([
+            *[f"_ord_{c}" for c in date_cols],  # iterates dict keys
+            *[f"_bin_{c}" for c in list(date_cols) + num_cols],  # list(date_cols) + num_cols is valid
+            '_strat_key'
+        ])]
         self._validate_date_distributions(full_data, sampled_data, date_cols)
 
         return sampled_data.head(sample_size)

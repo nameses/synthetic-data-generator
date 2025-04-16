@@ -26,29 +26,30 @@ class DataGenerator:
         self.datasetLoader = DatasetLoader()
 
     def define_metadata(self) -> Dict[str, FieldMetadata]:
-        # title,magnitude,date_time,cdi,mmi,alert,tsunami,sig,net,nst,dmin,gap,magType,depth,latitude,longitude,location,continent,country
         metadata = {
-            'app_name': FieldMetadata(DataType.STRING, faker_method=self.faker.company),
-            'magnitude': FieldMetadata(DataType.DECIMAL, min_value=6.5, max_value=9.1, decimal_places=1),
-            'date_time': FieldMetadata(DataType.DATETIME, datetime_format='%d-%m-%Y %H:%M',
-                                       datetime_min='01-01-1995 00:00',
-                                       datetime_max='31-12-2023 23:59'),
-            'cdi': FieldMetadata(DataType.INTEGER, min_value=0, max_value=9),
-            'mmi': FieldMetadata(DataType.INTEGER, min_value=1, max_value=10),
-            'alert': FieldMetadata(DataType.CATEGORICAL, allow_nans=True),
-            'tsunami': FieldMetadata(DataType.BOOLEAN),
-            'sig': FieldMetadata(DataType.INTEGER, min_value=650, max_value=2910),
-            'net': FieldMetadata(DataType.CATEGORICAL),
-            'nst': FieldMetadata(DataType.INTEGER, min_value=0, max_value=934),
-            'dmin': FieldMetadata(DataType.DECIMAL, min_value=0.0, max_value=17.7, decimal_places=3),
-            'gap': FieldMetadata(DataType.INTEGER, min_value=0, max_value=239),
-            'magType': FieldMetadata(DataType.CATEGORICAL),
-            'depth': FieldMetadata(DataType.DECIMAL, min_value=2.7, max_value=671.0, decimal_places=3),
-            'latitude': FieldMetadata(DataType.DECIMAL, min_value=-61.8, max_value=71.6, decimal_places=4),
-            'longitude': FieldMetadata(DataType.DECIMAL, min_value=-180.0, max_value=180.0, decimal_places=3),
-            'location': FieldMetadata(DataType.STRING, faker_method=self.faker.city),
-            'continent': FieldMetadata(DataType.CATEGORICAL, allow_nans=True),
-            'country': FieldMetadata(DataType.STRING, faker_method=self.faker.country, allow_nans=True)
+            'Gender': FieldMetadata(DataType.CATEGORICAL),
+            'Customer Type': FieldMetadata(DataType.CATEGORICAL),
+            'Age': FieldMetadata(DataType.INTEGER, min_value=7, max_value=85),
+            'Type of Travel': FieldMetadata(DataType.CATEGORICAL),
+            'Class': FieldMetadata(DataType.CATEGORICAL),
+            'Flight Distance': FieldMetadata(DataType.INTEGER, min_value=31, max_value=4983),
+            'Inflight wifi service': FieldMetadata(DataType.INTEGER, min_value=0, max_value=5),
+            'Departure/Arrival time convenient': FieldMetadata(DataType.INTEGER, min_value=0, max_value=5),
+            'Ease of Online booking': FieldMetadata(DataType.INTEGER, min_value=0, max_value=5),
+            'Gate location': FieldMetadata(DataType.INTEGER, min_value=0, max_value=5),
+            'Food and drink': FieldMetadata(DataType.INTEGER, min_value=0, max_value=5),
+            'Online boarding': FieldMetadata(DataType.INTEGER, min_value=0, max_value=5),
+            'Seat comfort': FieldMetadata(DataType.INTEGER, min_value=0, max_value=5),
+            'Inflight entertainment': FieldMetadata(DataType.INTEGER, min_value=0, max_value=5),
+            'On-board service': FieldMetadata(DataType.INTEGER, min_value=0, max_value=5),
+            'Leg room service': FieldMetadata(DataType.INTEGER, min_value=0, max_value=5),
+            'Baggage handling': FieldMetadata(DataType.INTEGER, min_value=1, max_value=5),
+            'Checkin service': FieldMetadata(DataType.INTEGER, min_value=0, max_value=5),
+            'Inflight service': FieldMetadata(DataType.INTEGER, min_value=0, max_value=5),
+            'Cleanliness': FieldMetadata(DataType.INTEGER, min_value=0, max_value=5),
+            'Departure Delay in Minutes': FieldMetadata(DataType.INTEGER, min_value=0, max_value=1592),
+            'Arrival Delay in Minutes': FieldMetadata(DataType.DECIMAL, min_value=0.0, max_value=1584.0),
+            'satisfaction': FieldMetadata(DataType.CATEGORICAL)
         }
 
         return {col: meta for col, meta in metadata.items()}
@@ -83,8 +84,8 @@ class DataGenerator:
 def main():
     try:
         EPOCHS = 100
-        REAL_SIZE = 1_000
-        SYNTHETIC_SIZE = 1_000
+        REAL_SIZE = 10_000
+        SYNTHETIC_SIZE = 10_000
 
         generator = DataGenerator()
 
@@ -94,7 +95,7 @@ def main():
 
         # load real data
         real_data = generator.load_real_data(
-            data_path='datasets/earthquake_1995-2023.csv',
+            data_path='datasets/airline-passenger-satisfaction.csv',
             metadata=metadata,
             sample_size=REAL_SIZE
         )
