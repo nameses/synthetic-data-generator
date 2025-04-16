@@ -328,12 +328,19 @@ class WGAN:
                     # Store metadata for reconstruction
                     valid_values = self.real_data[f'_num_{col}'][self.real_data[f'_num_{col}'].notna()]
                     if len(valid_values) > 0:
+                        dt_min = valid_values.min()
+                        dt_max = valid_values.max()
+                        # If the learned range is degenerate, override with metadata range if provided
+                        if dt_min == dt_max and meta.datetime_min and meta.datetime_max:
+                            dt_min = datetime.strptime(meta.datetime_min, meta.datetime_format).timestamp()
+                            dt_max = datetime.strptime(meta.datetime_max, meta.datetime_format).timestamp()
                         self.datetime_cols[col] = {
                             'type': meta.datetime_type,
                             'format': meta.datetime_format,
-                            'min': valid_values.min(),
-                            'max': valid_values.max()
+                            'min': dt_min,
+                            'max': dt_max
                         }
+                        self.datetime_ranges[col] = {'min': dt_min, 'max': dt_max}
                         self.numerical_cols.append(f'_num_{col}')
                     else:
                         logger.warning(f"No valid datetime values found for {col}")
@@ -1002,8 +1009,8 @@ class WGAN:
             logger.error("Non-finite metrics detected, stopping training")
             return True
 
-        if epoch < 50:
-            return False
+        #if epoch < 50:
+        #    return False
 
         # Check for loss divergence
         if metrics['d_loss'] > 100 or metrics['g_loss'] > 100:
@@ -1241,7 +1248,6 @@ class WGAN:
         if not meta or not meta.datetime_format:
             return [None] * n_samples
 
-        # Prefer metadata range if available
         try:
             if meta.datetime_min and meta.datetime_max:
                 dt_min = datetime.strptime(meta.datetime_min, meta.datetime_format)
@@ -1267,7 +1273,6 @@ class WGAN:
                 dates.append(dt.strftime(meta.datetime_format))
             except:
                 dates.append(None)
-
         return dates
 
     def _generate_string_column(self, column_name: str, meta: FieldMetadata, n_samples: int):
