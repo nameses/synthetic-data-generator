@@ -35,7 +35,7 @@ class GANConfig:
             d_lr: float = 1e-5,
             g_betas: tuple = (0.5, 0.9),
             d_betas: tuple = (0.5, 0.9),
-            patience: int = 30,
+            patience: int = 20,
             clip_value: float = 0.1,
             use_mixed_precision: bool = True,
             spectral_norm: bool = True,
@@ -1045,8 +1045,8 @@ class WGAN:
             logger.error("Non-finite metrics detected, stopping training")
             return True
 
-        #if epoch < 50:
-        #    return False
+        if epoch < 20:
+            return False
 
         # Check for loss divergence
         if metrics['d_loss'] > 100 or metrics['g_loss'] > 100:
@@ -1055,7 +1055,7 @@ class WGAN:
             return True
 
         # Normal early stopping logic
-        if metrics['g_loss'] < self._best_loss * 0.9:
+        if self._best_loss - metrics['g_loss'] > 1e-3:
             logger.info("Improvement detected (%.4f -> %.4f)", self._best_loss, metrics['g_loss'])
             self._best_loss = metrics['g_loss']
             self._no_improve = 0

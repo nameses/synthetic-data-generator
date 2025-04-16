@@ -34,7 +34,7 @@ class DataGenerator:
             'Class': FieldMetadata(DataType.CATEGORICAL),
             'Flight Distance': FieldMetadata(DataType.INTEGER, min_value=31, max_value=4983),
             'Inflight wifi service': FieldMetadata(DataType.INTEGER, min_value=0, max_value=5),
-            'Departure/Arrival time convenient': FieldMetadata(DataType.INTEGER, min_value=0, max_value=5),
+            'Departure or Arrival time convenient': FieldMetadata(DataType.INTEGER, min_value=0, max_value=5),
             'Ease of Online booking': FieldMetadata(DataType.INTEGER, min_value=0, max_value=5),
             'Gate location': FieldMetadata(DataType.INTEGER, min_value=0, max_value=5),
             'Food and drink': FieldMetadata(DataType.INTEGER, min_value=0, max_value=5),
@@ -48,7 +48,7 @@ class DataGenerator:
             'Inflight service': FieldMetadata(DataType.INTEGER, min_value=0, max_value=5),
             'Cleanliness': FieldMetadata(DataType.INTEGER, min_value=0, max_value=5),
             'Departure Delay in Minutes': FieldMetadata(DataType.INTEGER, min_value=0, max_value=1592),
-            'Arrival Delay in Minutes': FieldMetadata(DataType.DECIMAL, min_value=0.0, max_value=1584.0),
+            'Arrival Delay in Minutes': FieldMetadata(DataType.DECIMAL, min_value=0.0, max_value=1584.0, decimal_places=1),
             'satisfaction': FieldMetadata(DataType.CATEGORICAL)
         }
 
@@ -84,7 +84,7 @@ class DataGenerator:
 def main():
     try:
         EPOCHS = 100
-        REAL_SIZE = 10_000
+        REAL_SIZE = 50_000
         SYNTHETIC_SIZE = 10_000
 
         generator = DataGenerator()
