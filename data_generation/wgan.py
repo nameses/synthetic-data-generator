@@ -35,7 +35,7 @@ class GANConfig:
             d_lr: float = 1e-5,
             g_betas: tuple = (0.5, 0.9),
             d_betas: tuple = (0.5, 0.9),
-            patience: int = 20,
+            patience: int = 40,
             clip_value: float = 0.1,
             use_mixed_precision: bool = True,
             spectral_norm: bool = True,
@@ -252,7 +252,10 @@ class WGAN:
         }
 
         # Identify column types
-        self.numerical_cols = [col for col, meta in metadata.items() if meta.data_type in [DataType.INTEGER, DataType.DECIMAL]]
+        self.numerical_cols = [col for col in self.real_data.columns
+                               if col.startswith('_num_') or
+                               (col in self.metadata and
+                                self.metadata[col].data_type in [DataType.INTEGER, DataType.DECIMAL])]
         self.categorical_cols = [col for col, meta in metadata.items() if meta.data_type == DataType.CATEGORICAL]
         self.boolean_cols = [col for col, meta in metadata.items() if meta.data_type == DataType.BOOLEAN]
 
@@ -483,20 +486,12 @@ class WGAN:
         ).to(self.device)
 
         # Optimizers
-        self.opt_g = optim.Adam(
-            self.generator.parameters(),
-            lr=self.config.g_lr,
-            betas=self.config.g_betas
-        )
-        self.opt_d = optim.Adam(
-            self.discriminator.parameters(),
-            lr=self.config.d_lr,
-            betas=self.config.d_betas
-        )
+        self.opt_g = optim.Adam(self.generator.parameters(),lr=self.config.g_lr,betas=self.config.g_betas)
+        self.opt_d = optim.Adam(self.discriminator.parameters(),lr=self.config.d_lr,betas=self.config.d_betas)
 
         # Learning rate schedulers=
-        self.scheduler_g = torch.optim.lr_scheduler.StepLR(self.opt_g, step_size=10, gamma=0.95)
-        self.scheduler_d = torch.optim.lr_scheduler.StepLR(self.opt_d, step_size=10, gamma=0.95)
+        self.scheduler_g = torch.optim.lr_scheduler.CosineAnnealingLR(self.opt_g, T_max=self.config.max_epochs)
+        self.scheduler_d = torch.optim.lr_scheduler.CosineAnnealingLR(self.opt_d, T_max=self.config.max_epochs)
 
         # Mixed precision
         self.scaler = torch.amp.GradScaler(enabled=self.config.use_mixed_precision)
@@ -915,26 +910,26 @@ class WGAN:
     def calibrate_numeric_columns(self, synthetic_df):
         for col in self.numerical_cols:
             if col not in synthetic_df.columns:
+                continue  # Skip columns that are not present.
+            if col.startswith('_num_') and col[5:] in self.datetime_cols:
+                dt_meta = self.datetime_cols[col[5:]]
+                # Linear mapping from [-5, 5] to [min, max]
+                synthetic_df[col] = (synthetic_df[col] - (-5)) / (5 - (-5)) * (dt_meta['max'] - dt_meta['min']) + \
+                                    dt_meta['min']
                 continue
-
-            # Handle duplicate values by adding tiny noise
+            # Calibration for non-datetime columns using quantile mapping.
             synth_vals = synthetic_df[col].values.copy()
             if len(np.unique(synth_vals)) < len(synth_vals):
                 noise = np.random.normal(0, 1e-10 * synth_vals.std(), size=len(synth_vals))
                 synth_vals = synth_vals + noise
                 synthetic_df[col] = synth_vals
-
-            # Calculate quantiles with epsilon padding
             epsilon = 1e-10
             quantiles = np.linspace(epsilon, 1 - epsilon, 100)
-
             try:
                 orig_quantiles = np.quantile(self.real_data[col].dropna(), quantiles)
                 synth_quantiles = np.quantile(synth_vals[~np.isnan(synth_vals)], quantiles)
-
-                # Create robust mapping function
                 valid_mask = ~np.isnan(orig_quantiles) & ~np.isnan(synth_quantiles)
-                if valid_mask.sum() > 1:  # Need at least 2 points for interpolation
+                if valid_mask.sum() > 1:
                     mapping = interp1d(
                         synth_quantiles[valid_mask],
                         orig_quantiles[valid_mask],
@@ -946,29 +941,20 @@ class WGAN:
             except Exception as e:
                 logger.warning(f"Calibration failed for {col}: {str(e)}")
                 continue
-
-            # Apply decimal places if specified in metadata
             if col in self.metadata:
                 meta = self.metadata[col]
                 if meta.data_type == DataType.INTEGER:
-                    # Only convert non-NaN values to integers
                     mask = ~synthetic_df[col].isna()
                     synthetic_df.loc[mask, col] = synthetic_df.loc[mask, col].round().astype(int)
                 elif meta.decimal_places is not None:
                     synthetic_df[col] = synthetic_df[col].round(meta.decimal_places)
-
-            # Handle boolean columns that were numeric in original data
             if col in self.boolean_cols and col in self.real_data.columns:
                 if self.real_data[col].dtype.kind in ['i', 'b']:
-                    # Only convert non-NaN values to boolean/int
                     mask = ~synthetic_df[col].isna()
                     synthetic_df.loc[mask, col] = synthetic_df.loc[mask, col].astype(self.real_data[col].dtype)
-
-            # Ensure constraints are still met
             if col in self.num_ranges:
                 min_val, max_val = self.num_ranges[col]
                 synthetic_df[col] = synthetic_df[col].clip(min_val, max_val)
-
         return synthetic_df
 
     def _recover_from_failure(self):
@@ -1039,32 +1025,25 @@ class WGAN:
 
     def generate(self, n_samples):
         self.generator.eval()
-
         with torch.no_grad():
             batch_size = min(512, n_samples)
             synthetic_num = []
             synthetic_nan = []
 
+            # Generate synthetic numeric and NaN mask batches
             for i in range(0, n_samples, batch_size):
                 current_batch = min(batch_size, n_samples - i)
                 noise = torch.randn(current_batch, self.config.latent_dim, device=self.device)
-
                 if self.num_categorical > 0 and hasattr(self, 'X_cat') and self.X_cat is not None:
                     idx = torch.randint(0, len(self.X_cat), (current_batch,))
                     cat_samples = self.X_cat[idx].to(self.device)
                 else:
                     cat_samples = None
-
                 batch_num, batch_nan_probs = self.generator(noise, cat_samples)
-
-                # Apply NaN masking if we have NaN columns
                 if self.num_nan > 0 and batch_nan_probs is not None:
                     logger.debug(f"[GEN] Sample NaN prob stats: {batch_nan_probs.mean().item():.4f}")
-
                     nan_mask = torch.zeros(current_batch, len(self.metadata),
                                            device=self.device, dtype=torch.bool)
-
-                    # Map each NaN column to its position in the data
                     for nan_idx, col in enumerate(self.nan_columns):
                         if col in self.numerical_cols:
                             data_idx = self.numerical_cols.index(col)
@@ -1074,51 +1053,55 @@ class WGAN:
                             data_idx = self.num_numerical + self.categorical_cols.index(col)
                             nan_mask[:, data_idx] = torch.rand_like(batch_nan_probs[:, nan_idx]) < batch_nan_probs[:,
                                                                                                    nan_idx]
-
-                    # Apply the mask to numerical data
-                    batch_num = torch.where(nan_mask[:, :self.num_numerical], torch.tensor(float('nan'), device=self.device), batch_num)
-
-                    # Store the full mask for all columns
+                    batch_num = torch.where(nan_mask[:, :self.num_numerical],
+                                            torch.tensor(float('nan'), device=self.device),
+                                            batch_num)
                     batch_nan = nan_mask.float()
                 else:
                     batch_nan = None
-
                 synthetic_num.append(batch_num.cpu().numpy())
                 if batch_nan is not None:
                     synthetic_nan.append(batch_nan.cpu().numpy())
 
-            # Combine batches
+            # Assemble the numeric DataFrame using self.numerical_cols (which already includes the datetime numeric columns)
             synthetic_num = np.vstack(synthetic_num)
-            synthetic_nan = np.vstack(synthetic_nan) if synthetic_nan else None
-
-            # Create DataFrame with numerical columns
             synthetic_df = pd.DataFrame(synthetic_num, columns=self.numerical_cols)
+            if synthetic_nan is not None:
+                synthetic_nan = np.vstack(synthetic_nan)
 
-            # Handle categorical columns
-            if self.num_categorical > 0:
-                # Generate categorical data
-                for col in self.categorical_cols:
-                    if col in self.categorical_encoders:
-                        encoder = self.categorical_encoders[col]['onehot']
-                        categories = encoder.categories_[0]
-                        real_counts = self.real_data[col].value_counts(normalize=True)
-                        probs = real_counts.reindex(categories, fill_value=0).values
-                        probs = probs / probs.sum()
-                        synthetic_df[col] = np.random.choice(categories, size=n_samples, p=probs)
+            # FIRST: Calibrate numeric columns (including datetime numeric columns)
+            synthetic_df = self.calibrate_numeric_columns(synthetic_df)
 
-            # Apply NaN masks to all column types
-            if synthetic_nan is not None and len(self.nan_columns) > 0:
-                # Create mapping from column name to its NaN mask index
-                nan_col_indices = {col: idx for idx, col in enumerate(self.nan_columns)}
+            for dt_col in self.datetime_cols.keys():
+                numeric_col = f'_num_{dt_col}'
+                if numeric_col in synthetic_df.columns:
+                    meta_info = self.datetime_cols[dt_col]
+                    date_strings = []
+                    for num_val in synthetic_df[numeric_col]:
+                        if pd.isna(num_val):
+                            date_strings.append(None)
+                        else:
+                            try:
+                                if meta_info['type'] == 'date':
+                                    ordinal = int(np.clip(num_val, 1, 3652059))
+                                    dt = datetime.fromordinal(ordinal)
+                                elif meta_info['type'] == 'time':
+                                    seconds = int(np.clip(num_val, 0, 86399))
+                                    dt = datetime(2000, 1, 1, seconds // 3600 % 24,
+                                                  (seconds % 3600) // 60,
+                                                  seconds % 60)
+                                else:  # 'datetime'
+                                    timestamp = np.clip(num_val, 0, 4102444800)
+                                    dt = datetime.fromtimestamp(timestamp)
+                                date_strings.append(dt.strftime(self.metadata[dt_col].datetime_format))
+                            except Exception as e:
+                                logger.warning(f"Error reconstructing datetime for {dt_col}: {str(e)}")
+                                date_strings.append(None)
+                    synthetic_df[dt_col] = date_strings
+                    synthetic_df.drop(numeric_col, axis=1, inplace=True)
+                else:
+                    synthetic_df[dt_col] = self._generate_datetime_column(dt_col, n_samples)
 
-                # Apply NaN to all column types
-                for col in self.nan_columns:
-                    if col in synthetic_df.columns:
-                        nan_idx = nan_col_indices[col]
-                        nan_mask = synthetic_nan[:, nan_idx] > 0.5
-                        synthetic_df.loc[nan_mask, col] = np.nan
-
-            # Handle remaining columns (strings, datetimes, etc.)
             for col, meta in self.metadata.items():
                 if col not in synthetic_df.columns:
                     if meta.data_type == DataType.STRING and meta.faker_method:
@@ -1131,72 +1114,49 @@ class WGAN:
                             synthetic_df[col] = np.random.random(n_samples) < true_prob
                         else:
                             synthetic_df[col] = np.random.random(n_samples) < 0.5
-                    elif meta.data_type == DataType.CATEGORICAL:
-                        if col in self.real_data.columns:
-                            categories = self.real_data[col].dropna().unique()
-                            if len(categories) > 0:
-                                synthetic_df[col] = np.random.choice(categories, size=n_samples)
+
+                    # FOURTH: Synthesize categorical columns using real-data distributions.
+                    for col in self.categorical_cols:
+                        if col in self.categorical_encoders:
+                            encoder = self.categorical_encoders[col]['onehot']
+                            categories = encoder.categories_[0]
+                            real_counts = self.real_data[col].value_counts(normalize=True).reindex(categories,
+                                                                                                   fill_value=0)
+                            probs = real_counts.values
+                            if probs.sum() > 0:
+                                probs = probs / probs.sum()
+                            else:
+                                probs = np.ones_like(probs) / len(probs)
+                            synthetic_df[col] = np.random.choice(categories, size=n_samples, p=probs)
                         else:
-                            synthetic_df[col] = ['category_' + str(i) for i in range(n_samples)]
+                            if col in self.real_data.columns:
+                                real_counts = self.real_data[col].value_counts(normalize=True).sort_index()
+                                categories = real_counts.index.tolist()
+                                probs = real_counts.values
+                                synthetic_df[col] = np.random.choice(categories, size=n_samples, p=probs)
+                            else:
+                                synthetic_df[col] = ['category_' + str(i) for i in range(n_samples)]
 
-                    # Apply NaN if column is in nan_columns
-                    if col in self.nan_columns and synthetic_nan is not None:
-                        nan_idx = self.nan_columns.index(col)
-                        nan_mask = synthetic_nan[:, nan_idx] > 0.5
-                        synthetic_df.loc[nan_mask, col] = np.nan
+                    # FIFTH: Apply NaN masks to synthetic_df if available.
+                    if synthetic_nan is not None and len(self.nan_columns) > 0:
+                        for col in self.nan_columns:
+                            if col in synthetic_df.columns:
+                                nan_idx = self.nan_columns.index(col)
+                                nan_mask = synthetic_nan[:, nan_idx] > 0.5
+                                synthetic_df.loc[nan_mask, col] = np.nan
 
-            # Calibrate numeric columns
-            synthetic_df = self.calibrate_numeric_columns(synthetic_df)
+                    # SIXTH: Fill categorical NaNs using mode values.
+                    for col in self.categorical_cols:
+                        if col in synthetic_df.columns and synthetic_df[col].isna().any():
+                            if col in self.real_data.columns:
+                                mode_val = self.real_data[col].mode()[0] if len(
+                                    self.real_data[col].mode()) > 0 else 'missing'
+                            else:
+                                mode_val = 'missing'
+                            synthetic_df[col] = synthetic_df[col].fillna(mode_val)
 
-            # Handle NaN values in categorical columns
-            for col in self.categorical_cols:
-                if col in synthetic_df.columns and synthetic_df[col].isna().any():
-                    # Fill NaN with a special category or mode
-                    if col in self.real_data.columns:
-                        mode_val = self.real_data[col].mode()[0] if len(self.real_data[col].mode()) > 0 else 'missing'
-                    else:
-                        mode_val = 'missing'
-                    synthetic_df[col] = synthetic_df[col].fillna(mode_val)
-
-                # Reconstruct datetime columns
-                for col, meta in self.datetime_cols.items():
-                    num_col = f'_num_{col}'
-                    if num_col in synthetic_df.columns:
-                        # Scale back to original range
-                        synthetic_df[num_col] = (
-                                (synthetic_df[num_col] - (-5)) / (5 - (-5)) *  # Normalized to [-5,5]
-                                (meta['max'] - meta['min']) + meta['min']
-                        )
-
-                        # Convert to datetime objects
-                        values = []
-                        for num_val in synthetic_df[num_col]:
-                            if pd.isna(num_val):
-                                values.append(None)
-                                continue
-                            try:
-                                num_val = float(num_val)
-                                if meta['type'] == 'date':
-                                    ordinal = int(np.clip(num_val, 1, 3652059))
-                                    dt = datetime.fromordinal(ordinal)
-                                elif meta['type'] == 'time':
-                                    seconds = int(np.clip(num_val, 0, 86399))
-                                    dt = datetime(2000, 1, 1, seconds // 3600 % 24, (seconds % 3600) // 60,
-                                                  seconds % 60)
-                                else:  # datetime
-                                    timestamp = np.clip(num_val, 0, 4102444800)
-                                    dt = datetime.fromtimestamp(timestamp)
-                                values.append(dt.strftime(meta['format']))
-                            except Exception as e:
-                                logger.warning(f"Error reconstructing datetime for {col}: {str(e)}")
-                                values.append(None)
-
-                        synthetic_df[col] = values
-                        synthetic_df.drop(num_col, axis=1, inplace=True)
-
-            synthetic_df = self._postprocess_nans(synthetic_df)
-
-            return synthetic_df
+                    synthetic_df = self._postprocess_nans(synthetic_df)
+                    return synthetic_df
 
     def _apply_nans(self, series, meta):
         """Apply NaN values to a series based on metadata"""
