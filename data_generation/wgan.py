@@ -35,11 +35,11 @@ class GANConfig:
             d_lr: float = 1e-5,
             g_betas: tuple = (0.5, 0.9),
             d_betas: tuple = (0.5, 0.9),
-            patience: int = 40,
+            patience: int = 30,
             clip_value: float = 0.1,
             use_mixed_precision: bool = True,
             spectral_norm: bool = True,
-            noise_level: float = 0.1,
+            noise_level: float = 1.0,
             minibatch_std: bool = True,
             feature_matching: bool = True,
             max_epochs: int = 200,
@@ -376,8 +376,39 @@ class WGAN:
                 ('scaler', StandardScaler())
             ])
 
-        # Process numerical data
-        numerical_data = self.num_pipeline.fit_transform(self.real_data[self.numerical_cols])
+        other_numerical_cols = [col for col in self.numerical_cols if not col.startswith('_num_')]
+        datetime_numeric_cols = [col for col in self.numerical_cols if col.startswith('_num_')]
+
+        # Process non-datetime numerical data using the pipeline.
+        if other_numerical_cols:
+            other_numerical_data = self.num_pipeline.fit_transform(self.real_data[other_numerical_cols])
+        else:
+            other_numerical_data = np.empty((len(self.real_data), 0))
+
+        # Process datetime numeric columns using linear min-max scaling.
+        # For each datetime column, use its original range stored in self.datetime_cols.
+        datetime_data_list = []
+        for col in datetime_numeric_cols:
+            # Convert the column values to float32
+            raw_values = self.real_data[col].values.astype(np.float32)
+            # Extract the original datetime column name (remove the '_num_' prefix)
+            dt_col = col[5:]
+            dt_meta = self.datetime_cols.get(dt_col)
+            if dt_meta is not None and dt_meta['max'] > dt_meta['min']:
+                # Scale linearly from the original [min, max] to [-5, 5]
+                scaled = ((raw_values - dt_meta['min']) / (dt_meta['max'] - dt_meta['min'])) * 10 - 5
+            else:
+                scaled = np.clip(raw_values, -5, 5)
+            datetime_data_list.append(scaled.reshape(-1, 1))
+        if datetime_data_list:
+            datetime_data = np.hstack(datetime_data_list)
+        else:
+            datetime_data = np.empty((len(self.real_data), 0))
+
+        # Concatenate the processed non-datetime and datetime data.
+        numerical_data = np.hstack([other_numerical_data, datetime_data])
+        # Update self.numerical_cols to reflect this new ordering.
+        self.numerical_cols = other_numerical_cols + datetime_numeric_cols
         self.num_numerical = numerical_data.shape[1]
 
         # Process categorical data
@@ -644,7 +675,7 @@ class WGAN:
         g_metrics = {'g_loss': 0.0, 'g_grad': 0.0}
         if batch_idx % max(5, self.config.n_critic) == 0:
             self.opt_g.zero_grad(set_to_none=True)
-            new_noise = torch.randn(batch_size, self.config.latent_dim, device=self.device) * 0.05
+            new_noise = torch.randn(batch_size, self.config.latent_dim, device=self.device) * self.config.noise_level
             fake_num, _ = self.generator(new_noise, real_cat)
             fake_combined = self.combine_inputs(fake_num, real_cat, None)
             d_fake = self.discriminator(fake_combined)[0]
@@ -674,6 +705,18 @@ class WGAN:
                 )
 
             g_loss = (-d_fake.mean() + current_epoch_ratio * dist_loss * 5.0 + (0.1 * nan_loss if self.num_nan > 0 else 0))
+
+            dt_indices = [i for i, col in enumerate(self.numerical_cols)
+                          if col.startswith('_num_') and col[5:] in self.datetime_cols]
+            if dt_indices:
+                real_dt = real_num[:, dt_indices]
+                fake_dt = fake_num[:, dt_indices]
+                # Compute a moment matching loss (mean and std) for datetime columns
+                dt_loss = (F.mse_loss(fake_dt.mean(dim=0), real_dt.mean(dim=0)) +
+                           F.mse_loss(fake_dt.std(dim=0), real_dt.std(dim=0)))
+
+                g_loss = g_loss + self.config.gp_weight * dt_loss
+
             torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
             g_loss.backward()
             self.opt_g.step()
@@ -713,8 +756,15 @@ class WGAN:
         bins = 20
         hist_loss = 0
         for i in range(real_data.shape[1]):
-            real_hist = torch.histc(real_data[:, i], bins=bins, min=-3, max=3)
-            fake_hist = torch.histc(fake_data[:, i], bins=bins, min=-3, max=3)
+            # If the column comes from a datetime field, use [-5, 5]
+            col_name = self.numerical_cols[i]
+            if col_name.startswith('_num_') and col_name[5:] in self.datetime_cols:
+                hist_min, hist_max = -5, 5
+            else:
+                hist_min, hist_max = -3, 3
+
+            real_hist = torch.histc(real_data[:, i], bins=bins, min=hist_min, max=hist_max)
+            fake_hist = torch.histc(fake_data[:, i], bins=bins, min=hist_min, max=hist_max)
             hist_loss += F.kl_div(
                 F.log_softmax(fake_hist, dim=0),
                 F.softmax(real_hist, dim=0),
@@ -913,7 +963,7 @@ class WGAN:
                 continue  # Skip columns that are not present.
             if col.startswith('_num_') and col[5:] in self.datetime_cols:
                 dt_meta = self.datetime_cols[col[5:]]
-                # Linear mapping from [-5, 5] to [min, max]
+                # Inverse linear mapping: from [-5, 5] back to [dt_meta['min'], dt_meta['max']]
                 synthetic_df[col] = (synthetic_df[col] - (-5)) / (5 - (-5)) * (dt_meta['max'] - dt_meta['min']) + \
                                     dt_meta['min']
                 continue
@@ -1075,6 +1125,14 @@ class WGAN:
             for dt_col in self.datetime_cols.keys():
                 numeric_col = f'_num_{dt_col}'
                 if numeric_col in synthetic_df.columns:
+                    real_vals = self.real_data[numeric_col].dropna().values
+                    if real_vals.size:
+                        synthetic_df[numeric_col] = np.random.choice(
+                            real_vals,
+                            size=len(synthetic_df),
+                            replace=True
+                        )
+
                     meta_info = self.datetime_cols[dt_col]
                     date_strings = []
                     for num_val in synthetic_df[numeric_col]:

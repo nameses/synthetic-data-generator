@@ -100,7 +100,9 @@ def generate_comparison_report(
 
         # 2. Column-level analyses
         report_content.append("\n=== COLUMN-LEVEL ANALYSIS ===")
-        all_columns = set(real_data.columns).union(set(synthetic_data.columns)).union(set(metadata.keys()))
+        all_columns = set([col for col in real_data.columns if not col.startswith('_num_')]).union(
+            set(synthetic_data.columns)).union(set(metadata.keys()))
+
         for col_idx, col in enumerate(all_columns):
             try:
                 meta = metadata.get(col)
