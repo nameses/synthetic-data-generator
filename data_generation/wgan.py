@@ -1113,11 +1113,15 @@ class WGAN:
                 if batch_nan is not None:
                     synthetic_nan.append(batch_nan.cpu().numpy())
 
-            # Assemble the numeric DataFrame using self.numerical_cols (which already includes the datetime numeric columns)
+            # assemble numeric data
             synthetic_num = np.vstack(synthetic_num)
             synthetic_df = pd.DataFrame(synthetic_num, columns=self.numerical_cols)
-            if synthetic_nan is not None:
+
+            # only stack nan‐mask arrays if we collected any
+            if len(synthetic_nan) > 0:
                 synthetic_nan = np.vstack(synthetic_nan)
+            else:
+                synthetic_nan = None
 
             # FIRST: Calibrate numeric columns (including datetime numeric columns)
             synthetic_df = self.calibrate_numeric_columns(synthetic_df)
