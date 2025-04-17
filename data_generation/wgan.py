@@ -1,30 +1,24 @@
-"""
-Gaussian‑Copula ⇒ WGAN‑GP synthetic‑data engine.
+# data_generation/wgan.py
+"""Gaussian‑copula + categorical‑aware WGAN‑GP with modern tricks."""
 
-The pipeline:
-
-    1.  Fit per‑column transformers that map each feature to a
-        *standard‑normal* space (copula space).
-    2.  Train a Wasserstein GAN with gradient penalty on that
-        dense numeric matrix.
-    3.  Sample the generator and **inverse‑transform** every column
-        back to its original domain.
-"""
 from __future__ import annotations
 
 import logging
+import math
 import random
-from collections import defaultdict
-from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Tuple
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Sequence
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from faker import Faker
 from scipy.stats import norm, rankdata
+from torch.nn.utils import spectral_norm
 from torch.utils.data import DataLoader, TensorDataset
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
 from models.enums import DataType
 from models.field_metadata import FieldMetadata
@@ -32,14 +26,15 @@ from models.field_metadata import FieldMetadata
 LOGGER = logging.getLogger(__name__)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ---------------------------------------------------------------------#
-# CONFIG & MODELS
-# ---------------------------------------------------------------------#
+# -----------------------------------------------------------------------------#
+# CONFIG
+# -----------------------------------------------------------------------------#
 
 
 @dataclass(slots=True)
 class GanConfig:
     latent_dim: int = 128
+    hidden: int = 256
     batch_size: int = 256
     n_critic: int = 5
     gp_weight: float = 10.0
@@ -47,296 +42,353 @@ class GanConfig:
     d_lr: float = 2e-4
     max_epochs: int = 300
     seed: int = 42
-    amp: bool = True  # Automatic Mixed Precision
+    amp: bool = True
+    # learning‑rate schedule
+    t0: int = 10
+    t_mult: int = 2
+    # early stopping
+    patience: int = 200
+    # gumbel‑softmax temperature
+    tau_start: float = 1.5
+    tau_end: float = 0.3
 
 
-class _MLPGen(nn.Module):
-    def __init__(self, cfg: GanConfig, out_dim: int) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(cfg.latent_dim, 256),
-            nn.LeakyReLU(0.2),
-            nn.Linear(256, 256),
-            nn.LeakyReLU(0.2),
-            nn.Linear(256, out_dim),
-        )
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:  # [B, out_dim]
-        return self.net(z)
-
-
-class _MLPDisc(nn.Module):
-    def __init__(self, in_dim: int) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, 256),
-            nn.LeakyReLU(0.2),
-            nn.Linear(256, 256),
-            nn.LeakyReLU(0.2),
-            nn.Linear(256, 1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # [B]
-        return self.net(x).view(-1)
-
-
-# ---------------------------------------------------------------------#
-# COLUMN‑LEVEL TRANSFORMERS  (copula helpers)
-# ---------------------------------------------------------------------#
+# -----------------------------------------------------------------------------#
+# TRANSFORMERS –  numeric / datetime  (categoricals handled separately)
+# -----------------------------------------------------------------------------#
 
 
 class _BaseTransformer:
-    """Abstract base‑class for fit/transform/inverse routines."""
-
-    def fit(self, series: pd.Series) -> "_BaseTransformer":  # noqa: D401
-        raise NotImplementedError
-
-    def transform(self, series: pd.Series) -> np.ndarray:
-        raise NotImplementedError
-
-    def inverse(self, values: np.ndarray) -> pd.Series:
-        raise NotImplementedError
+    def fit(self, series: pd.Series): ...
+    def transform(self, series: pd.Series) -> np.ndarray: ...
+    def inverse(self, values: np.ndarray) -> pd.Series: ...
 
 
 class _ContinuousTransformer(_BaseTransformer):
-    """Ranks ⇒ uniform ⇒ Φ⁻¹  (as in Gaussian copula)."""
-
-    def __init__(self) -> None:
-        self.sorted_: np.ndarray | None = None
-
-    # --------------------------#
-    def fit(self, series: pd.Series) -> "_ContinuousTransformer":
+    def fit(self, series: pd.Series):
         self.sorted_ = np.sort(series.to_numpy(copy=True))
         return self
 
     def transform(self, series: pd.Series) -> np.ndarray:
-        # rankdata returns 1…n
         u = rankdata(series, method="average") / (len(series) + 1.0)
         return norm.ppf(u)
 
     def inverse(self, values: np.ndarray) -> pd.Series:
         u = norm.cdf(values).clip(0, 1)
-        # position in sorted empirical distribution
         idx = np.floor(u * (len(self.sorted_) - 1)).astype(int)
         return pd.Series(self.sorted_[idx], index=np.arange(len(values)))
 
 
-class _CategoricalTransformer(_BaseTransformer):
-    def __init__(self) -> None:
-        self.cat2idx_: Dict = {}
-        self.idx2cat_: Dict[int, str] = {}
-
-    def fit(self, series: pd.Series) -> "_CategoricalTransformer":
-        uniques = series.astype(str).unique().tolist()
-        self.cat2idx_ = {c: i for i, c in enumerate(sorted(uniques))}
-        self.idx2cat_ = {i: c for c, i in self.cat2idx_.items()}
-        return self
-
-    def transform(self, series: pd.Series) -> np.ndarray:
-        idx = series.astype(str).map(self.cat2idx_)
-        # map to Gaussian quantiles so we preserve correlations
-        u = (idx + 0.5) / len(self.cat2idx_)
-        return norm.ppf(u)
-
-    def inverse(self, values: np.ndarray) -> pd.Series:
-        u = norm.cdf(values).clip(0, 1 - 1e-12)
-        idx = np.floor(u * len(self.idx2cat_)).astype(int)
-        return pd.Series([self.idx2cat_[i] for i in idx], index=np.arange(len(values)))
-
-
-_BoolTransformer = _CategoricalTransformer  # identical handling
-
-
 class _DateTimeTransformer(_ContinuousTransformer):
-    """Treat epoch seconds as a continuous quantity."""
+    def __init__(self, fmt: str): self.fmt = fmt
 
-    def __init__(self, dt_format: str):
+    def fit(self, s): return super().fit(_to_epoch(s, self.fmt))
+    def transform(self, s): return super().transform(_to_epoch(s, self.fmt))
+    def inverse(self, v): return pd.to_datetime(super().inverse(v), unit="s").dt.strftime(self.fmt)
+
+
+def _to_epoch(s: pd.Series, fmt: str):
+    return pd.to_datetime(s, format=fmt, errors="coerce").astype("int64") // 10**9
+
+
+# -----------------------------------------------------------------------------#
+# NETWORK BUILDING BLOCKS
+# -----------------------------------------------------------------------------#
+
+
+def linear_sn(inp: int, out: int) -> nn.Linear:
+    return spectral_norm(nn.Linear(inp, out))
+
+
+class MinibatchStd(nn.Module):
+    """Append minibatch‑std‑dev as an extra feature (helps mode coverage)."""
+
+    def __init__(self): super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        std = torch.std(x, dim=0, keepdim=True)  # [1, F]
+        mean_std = std.mean().expand(x.size(0), 1)  # [B,1]
+        return torch.cat([x, mean_std], dim=1)      # [B, F+1]
+
+
+# -----------------------------------------------------------------------------#
+# GENERATOR  (numeric + categorical heads)
+# -----------------------------------------------------------------------------#
+
+
+class _Generator(nn.Module):
+    def __init__(self, cfg: GanConfig, out_num: int, cat_dims: List[int]):
         super().__init__()
-        self.fmt = dt_format
+        self.cfg = cfg
+        self.tau_start, self.tau_end = cfg.tau_start, cfg.tau_end
+        self.register_buffer("step", torch.zeros(1))  # updated externally
 
-    def fit(self, series: pd.Series) -> "_DateTimeTransformer":
-        unix = pd.to_datetime(series, format=self.fmt, errors="coerce").astype("int64") // 10**9
-        return super().fit(unix)
+        self.fc = nn.Sequential(
+            nn.Linear(cfg.latent_dim, cfg.hidden),
+            nn.LeakyReLU(0.2),
+            nn.Linear(cfg.hidden, cfg.hidden),
+            nn.LeakyReLU(0.2),
+            MinibatchStd(),
+            nn.Linear(cfg.hidden + 1, cfg.hidden),
+            nn.LeakyReLU(0.2),
+        )
 
-    def transform(self, series: pd.Series) -> np.ndarray:
-        unix = pd.to_datetime(series, format=self.fmt, errors="coerce").astype("int64") // 10**9
-        return super().transform(unix)
+        self.num_head = nn.Linear(cfg.hidden, out_num) if out_num else None
+        self.cat_heads = nn.ModuleList(
+            [nn.Linear(cfg.hidden, k) for k in cat_dims]
+        )
 
-    def inverse(self, values: np.ndarray) -> pd.Series:
-        unix = super().inverse(values)
-        return pd.to_datetime(unix.astype(int), unit="s").dt.strftime(self.fmt)
+    # ------------------------------------------------------------------#
+    def forward(self, z: torch.Tensor, hard: bool = False) -> torch.Tensor:
+        h = self.fc(z)
+        out = []
+
+        if self.num_head is not None:
+            out.append(self.num_head(h))  # numeric block
+
+        # adaptive temperature (cosine decay)
+        total_steps = (self.cfg.max_epochs * math.ceil(real_len / self.cfg.batch_size))
+        tau = self.tau_end + 0.5 * (self.tau_start - self.tau_end) * (
+            1 + math.cos(math.pi * self.step.item() / total_steps)
+        )
+
+        for head in self.cat_heads:
+            logits = head(h)
+            y = F.gumbel_softmax(logits, tau=tau, hard=hard)
+            out.append(y)
+
+        self.step += 1
+        return torch.cat(out, dim=1)
 
 
-# ---------------------------------------------------------------------#
+# -----------------------------------------------------------------------------#
+# DISCRIMINATOR
+# -----------------------------------------------------------------------------#
+
+
+class _Discriminator(nn.Module):
+    def __init__(self, inp_dim: int, cfg: GanConfig):
+        super().__init__()
+        self.net = nn.Sequential(
+            linear_sn(inp_dim, cfg.hidden),
+            nn.LeakyReLU(0.2),
+            linear_sn(cfg.hidden, cfg.hidden),
+            nn.LeakyReLU(0.2),
+            linear_sn(cfg.hidden, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x).view(-1)
+
+
+# -----------------------------------------------------------------------------#
 # MAIN DRIVER
-# ---------------------------------------------------------------------#
+# -----------------------------------------------------------------------------#
 
 
 class WGAN:
-    """
-    Gaussian‑copula WGAN‑GP for tabular data.
-
-    Use:
-        gan = WGAN(real_df, meta, GanConfig())
-        gan.fit()
-        synthetic = gan.generate(n_samples)
-    """
-
-    # --------------------------#
     def __init__(self, real: pd.DataFrame, meta: Dict[str, FieldMetadata], cfg: GanConfig):
+        global real_len; real_len = len(real)
         self.cfg, self.meta = cfg, meta
         self.faker = Faker()
-        self._set_seed(cfg.seed)
+        _set_seed(cfg.seed)
 
-        # build per‑column transformers
+        # -------- column analysis ------------------------------------------------
+        self.num_cols, self.dt_cols, self.cat_cols, self.str_cols = [], [], [], []
+        for c, m in meta.items():
+            if m.data_type in {DataType.INTEGER, DataType.DECIMAL}:
+                self.num_cols.append(c)
+            elif m.data_type is DataType.DATETIME:
+                self.dt_cols.append(c)
+            elif m.data_type in {DataType.CATEGORICAL, DataType.BOOLEAN}:
+                self.cat_cols.append(c)
+            elif m.data_type is DataType.STRING:
+                self.str_cols.append(c)
+
+        # ------------- transformers & one‑hots -----------------------------------
         self.transformers: Dict[str, _BaseTransformer] = {}
-        transformed_cols: List[np.ndarray] = []
+        mats = []
 
-        for col, m in meta.items():
-            tr = self._make_transformer(col, m)
-            self.transformers[col] = tr.fit(real[col])
-            transformed_cols.append(tr.transform(real[col]))
+        # numeric + datetime
+        for col in self.num_cols:
+            tr = _ContinuousTransformer().fit(real[col])
+            self.transformers[col] = tr
+            mats.append(tr.transform(real[col]))
+        for col in self.dt_cols:
+            tr = _DateTimeTransformer(meta[col].datetime_format).fit(real[col])
+            self.transformers[col] = tr
+            mats.append(tr.transform(real[col]))
 
-        # dense matrix in copula space
-        self._matrix = torch.tensor(np.stack(transformed_cols, axis=1), dtype=torch.float32)
-        self._output_dim: int = self._matrix.shape[1]
+        # categoricals → one‑hot
+        self.cat_sizes, self.cat_maps = [], {}
+        for col in self.cat_cols:
+            uniq = sorted(real[col].astype(str).unique())
+            self.cat_maps[col] = {v: i for i, v in enumerate(uniq)}
+            self.cat_sizes.append(len(uniq))
+            oh = F.one_hot(
+                torch.tensor(real[col].astype(str).map(self.cat_maps[col]).values),
+                num_classes=len(uniq),
+            ).numpy()
+            mats.append(oh.T)  # each class as its own row
 
-        # models / optimisers
-        self.G = _MLPGen(cfg, self._output_dim).to(DEVICE)
-        self.D = _MLPDisc(self._output_dim).to(DEVICE)
+        self.X_real = torch.tensor(np.vstack(mats).T, dtype=torch.float32)
+        self.inp_dim = self.X_real.shape[1]
+
+        # ------------- networks & opt -------------------------------------------
+        self.G = _Generator(cfg, len(self.num_cols) + len(self.dt_cols), self.cat_sizes).to(DEVICE)
+        self.D = _Discriminator(self.inp_dim, cfg).to(DEVICE)
+
         self.opt_g = torch.optim.Adam(self.G.parameters(), lr=cfg.g_lr, betas=(0.5, 0.9))
         self.opt_d = torch.optim.Adam(self.D.parameters(), lr=cfg.d_lr, betas=(0.5, 0.9))
-        self.scaler_g = torch.amp.GradScaler(device="cuda", enabled=cfg.amp)
-        self.scaler_d = torch.amp.GradScaler(device="cuda", enabled=cfg.amp)
 
-        self.loader = DataLoader(
-            TensorDataset(self._matrix), batch_size=cfg.batch_size, shuffle=True, drop_last=True
-        )
+        self.sch_g = CosineAnnealingWarmRestarts(self.opt_g, T_0=cfg.t0, T_mult=cfg.t_mult)
+        self.sch_d = CosineAnnealingWarmRestarts(self.opt_d, T_0=cfg.t0, T_mult=cfg.t_mult)
 
-        LOGGER.info("Initialised WGAN‑GP with shape %s, device=%s", self._matrix.shape, DEVICE)
+        self.scaler_g = torch.cuda.amp.GradScaler(enabled=cfg.amp)
+        self.scaler_d = torch.cuda.amp.GradScaler(enabled=cfg.amp)
+
+        self.loader = DataLoader(TensorDataset(self.X_real), batch_size=cfg.batch_size, shuffle=True, drop_last=True)
 
     # ------------------------------------------------------------------#
-    # public api
+    # TRAINING
     # ------------------------------------------------------------------#
-    def fit(self) -> None:
-        LOGGER.info("Training for %d epochs ...", self.cfg.max_epochs)
+    def fit(self):
+        best_g_loss = float("inf")
+        epochs_no_improve = 0
+
         for epoch in range(1, self.cfg.max_epochs + 1):
-            d_running, g_running = 0.0, 0.0
-            for i, (real,) in enumerate(self.loader, 1):
-                real = real.to(DEVICE)
-                d_loss = self._train_discriminator(real)
+            g_running, d_running = 0.0, 0.0
+
+            for i, (real_batch,) in enumerate(self.loader, 1):
+                real_batch = real_batch.to(DEVICE)
+                g_loss = torch.tensor(0.0, device=DEVICE)
+
+                d_loss = self._train_d(real_batch)
                 d_running += d_loss.item()
 
                 if i % self.cfg.n_critic == 0:
-                    g_loss = self._train_generator(real.size(0))
+                    g_loss = self._train_g(real_batch.size(0))
                     g_running += g_loss.item()
 
-            LOGGER.info(
-                "Epoch %3d | D: %.4f | G: %.4f",
-                epoch,
-                d_running / len(self.loader),
-                g_running / max(1, len(self.loader) // self.cfg.n_critic),
-            )
+                if (
+                        torch.isnan(d_loss) or torch.isinf(d_loss) or
+                        torch.isnan(g_loss) or torch.isinf(g_loss)
+                ):
+                    LOGGER.error("NaN/Inf detected – early stop.")
+                    return
 
+            # schedules
+            self.sch_g.step(epoch - 1)
+            self.sch_d.step(epoch - 1)
+
+            g_mean = g_running / max(1, len(self.loader) / self.cfg.n_critic)
+            LOGGER.info("Epoch %03d | D %.4f | G %.4f", epoch, d_running / len(self.loader), g_mean)
+
+            # early stopping
+            if g_mean + 1e-4 < best_g_loss:
+                best_g_loss = g_mean
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+            if epochs_no_improve > self.cfg.patience:
+                LOGGER.info("Early stopping: generator loss did not improve for %d epochs.", self.cfg.patience)
+                break
+
+    # ------------------------------------------------------------------#
+    # SYNTHESIS
+    # ------------------------------------------------------------------#
     def generate(self, n: int) -> pd.DataFrame:
         self.G.eval()
-        samples: List[np.ndarray] = []
+        out_rows = []
+        bs = self.cfg.batch_size
+
         with torch.no_grad():
-            for _ in range(0, n, self.cfg.batch_size):
-                cur = min(self.cfg.batch_size, n - len(samples))
+            for _ in range(0, n, bs):
+                cur = min(bs, n - len(out_rows))
                 z = torch.randn(cur, self.cfg.latent_dim, device=DEVICE)
-                fake = self.G(z).cpu().numpy()
-                samples.append(fake)
-        mat = np.vstack(samples)[:n]
+                fake = self.G(z, hard=True).cpu().numpy()
+                out_rows.append(fake)
+        mat = np.vstack(out_rows)[:n]
 
-        # inverse‑transform every column
-        columns: Dict[str, pd.Series] = {}
-        for i, (col, tr) in enumerate(self.transformers.items()):
-            series = tr.inverse(mat[:, i])
-            columns[col] = self._post_process(col, series)
+        # -------------- inverse transforms -----------------------------
+        ptr = 0
+        data: Dict[str, Sequence] = {}
 
-        df = pd.DataFrame(columns)
-        # re‑order exactly as metadata
-        df = df[list(self.meta.keys())]
-        return df.reset_index(drop=True)
+        # numeric
+        for col in self.num_cols:
+            tr = self.transformers[col]
+            data[col] = tr.inverse(mat[:, ptr])
+            ptr += 1
+        # datetime
+        for col in self.dt_cols:
+            tr = self.transformers[col]
+            data[col] = tr.inverse(mat[:, ptr])
+            ptr += 1
+        # categorical
+        for col, size in zip(self.cat_cols, self.cat_sizes):
+            one_hot = mat[:, ptr:ptr + size]
+            idx = one_hot.argmax(1).astype(int)
+            inv = {v: k for k, v in self.cat_maps[col].items()}
+            data[col] = pd.Series([inv[i] for i in idx])
+            ptr += size
+        # strings via Faker
+        for col in self.str_cols:
+            meta = self.meta[col]
+            fn: Callable = meta.faker_method or self.faker.word
+            data[col] = [fn(**(meta.faker_args or {})) for _ in range(n)]
+
+        return pd.DataFrame(data)[list(self.meta.keys())]
 
     # ------------------------------------------------------------------#
-    # internal helpers
+    # INTERNAL
     # ------------------------------------------------------------------#
-    @staticmethod
-    def _set_seed(seed: int) -> None:
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
+    def _train_d(self, real: torch.Tensor) -> torch.Tensor:
+        self.D.train()
+        self.opt_d.zero_grad(set_to_none=True)
 
-    def _make_transformer(self, col: str, m: FieldMetadata) -> _BaseTransformer:
-        if m.data_type in {DataType.INTEGER, DataType.DECIMAL}:
-            return _ContinuousTransformer()
-        if m.data_type is DataType.DATETIME:
-            if not m.datetime_format:
-                raise ValueError(f"datetime_format missing for column {col}")
-            return _DateTimeTransformer(m.datetime_format)
-        if m.data_type in {DataType.CATEGORICAL}:
-            return _CategoricalTransformer()
-        if m.data_type is DataType.BOOLEAN:
-            return _BoolTransformer()
-        if m.data_type is DataType.STRING:
-            # Not fed into the GAN at all; keep placeholder transformer that returns zeros
-            class _Stub(_BaseTransformer):
-                def fit(self, series): return self
-                def transform(self, series): return np.zeros(len(series))
-                def inverse(self, values): return pd.Series([None] * len(values))
-            return _Stub()
-        raise NotImplementedError(m)
+        z = torch.randn(real.size(0), self.cfg.latent_dim, device=DEVICE)
+        with torch.cuda.amp.autocast(enabled=self.cfg.amp):
+            fake = self.G(z).detach()
+            gp = self._gradient_penalty(real, fake)
+            loss = self.D(fake).mean() - self.D(real).mean() + self.cfg.gp_weight * gp
 
-    # ---------------- GAN steps ---------------- #
+        self.scaler_d.scale(loss).backward()
+        self.scaler_d.step(self.opt_d)
+        self.scaler_d.update()
+        return loss
+
+    def _train_g(self, batch: int) -> torch.Tensor:
+        self.G.train()
+        self.opt_g.zero_grad(set_to_none=True)
+
+        z = torch.randn(batch, self.cfg.latent_dim, device=DEVICE)
+        with torch.cuda.amp.autocast(enabled=self.cfg.amp):
+            fake = self.G(z)
+            loss = -self.D(fake).mean()
+
+        self.scaler_g.scale(loss).backward()
+        self.scaler_g.step(self.opt_g)
+        self.scaler_g.update()
+        return loss
+
+    # ------------------------------------------------------------------#
     def _gradient_penalty(self, real: torch.Tensor, fake: torch.Tensor) -> torch.Tensor:
         alpha = torch.rand(real.size(0), 1, device=DEVICE)
         mix = (alpha * real + (1 - alpha) * fake).requires_grad_(True)
-        with torch.amp.autocast('cuda', enabled=self.cfg.amp):
+
+        with torch.cuda.amp.autocast(enabled=self.cfg.amp):
             score = self.D(mix)
         grad = torch.autograd.grad(score.sum(), mix, create_graph=True)[0]
-        norm_grad = grad.view(grad.size(0), -1).norm(2, dim=1)
-        return ((norm_grad - 1) ** 2).mean()
+        return ((grad.view(grad.size(0), -1).norm(2, dim=1) - 1) ** 2).mean()
 
-    def _train_discriminator(self, real: torch.Tensor) -> torch.Tensor:
-        self.opt_d.zero_grad(set_to_none=True)
-        z = torch.randn(real.size(0), self.cfg.latent_dim, device=DEVICE)
-        with torch.amp.autocast('cuda', enabled=self.cfg.amp):
-            fake = self.G(z).detach()
-            d_loss = (
-                self.D(fake).mean()
-                - self.D(real).mean()
-                + self.cfg.gp_weight * self._gradient_penalty(real, fake)
-            )
-        self.scaler_d.scale(d_loss).backward()
-        self.scaler_d.step(self.opt_d)
-        self.scaler_d.update()
-        return d_loss
 
-    def _train_generator(self, batch: int) -> torch.Tensor:
-        self.opt_g.zero_grad(set_to_none=True)
-        z = torch.randn(batch, self.cfg.latent_dim, device=DEVICE)
-        with torch.amp.autocast('cuda', enabled=self.cfg.amp):
-            fake = self.G(z)
-            g_loss = -self.D(fake).mean()
-        self.scaler_g.scale(g_loss).backward()
-        self.scaler_g.step(self.opt_g)
-        self.scaler_g.update()
-        return g_loss
+# -----------------------------------------------------------------------------#
+# UTILS
+# -----------------------------------------------------------------------------#
 
-    # ---------------- post‑processing helpers ---------------- #
-    def _post_process(self, col: str, series: pd.Series) -> pd.Series:
-        m = self.meta[col]
-        if m.data_type is DataType.INTEGER:
-            return series.round().astype(int)
-        if m.data_type is DataType.DECIMAL:
-            if m.decimal_places is not None:
-                return series.round(m.decimal_places)
-            return series
-        if m.data_type is DataType.STRING:
-            faker_fn: Callable = m.faker_method or self.faker.word
-            return pd.Series([faker_fn(**(m.faker_args or {})) for _ in range(len(series))])
-        return series
+
+def _set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
