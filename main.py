@@ -84,7 +84,7 @@ metadata_adult = {
 
 def main():
     try:
-        synthetic_size = 40_000
+        synthetic_size = 20_000
 
         # define metadata
         metadata = metadata_airline
@@ -97,7 +97,7 @@ def main():
             # data_path='datasets/healthcare_dataset.csv',
             # data_path='datasets/adult.csv',
             metadata=metadata
-        )
+        ).head(40_000)
 
         generator = WGAN(real=real_data, meta=metadata, cfg=GanConfig())
 
