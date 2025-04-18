@@ -114,6 +114,12 @@ def main():
         report_path = generate_report(real_data, synthetic_data, metadata)
         logger.info(f"Generated comparison report at: {report_path}")
 
+        # synthetic_data = pd.read_csv('reports/reports_20250418/report_20250418_040050/synthetic.csv')
+
+        # # generate comparison
+        # report_path = generate_report(real_data, synthetic_data, metadata)
+        # logger.info(f"Generated comparison report at: {report_path}")
+
     except Exception as e:
         logger.error(f"Error in data generation pipeline: {str(e)}", exc_info=True)
         raise
