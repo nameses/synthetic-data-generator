@@ -156,6 +156,7 @@ class VAEPipeline:
         for epoch in range(1, self.cfg.epochs+1):
             self.model.train()
             train_loss = 0.0
+            sum_recon = sum_kl = sum_cov = sum_sign = sum_mmd = 0.0
             for xb, in train_loader:
                 xb = xb.to(self.cfg.device)
                 x_hat, mu, logvar = self.model(xb)
@@ -172,6 +173,11 @@ class VAEPipeline:
                        + self.cfg.lambda_mmd * mmd_loss
                 opt.zero_grad(); loss.backward(); opt.step()
                 train_loss += loss.item()
+                sum_recon += recon.item()
+                sum_kl += kl.item()
+                sum_cov += cov_loss.item()
+                sum_sign += sign_loss.item()
+                sum_mmd += mmd_loss.item()
             train_loss /= len(train_loader)
             # Validation
             self.model.eval()
@@ -190,12 +196,22 @@ class VAEPipeline:
             else:
                 scheduler.step(val_loss)
             # Checkpoint
+            lr = opt.param_groups[0]['lr']
             if val_loss < best_val:
                 best_val = val_loss
-                path = f"checkpoints/vae_best.pt"
+                path = f"checkpoints/vae_best_epoch{epoch}.pt"
                 torch.save(self.model.state_dict(), path)
+                if self.cfg.verbose:
+                    print(f"Checkpoint saved: {path} (val_loss={val_loss:.4f})")
+            # Logging
             if self.cfg.verbose:
-                print(f"Epoch {epoch:03d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+                print(
+                    f"Epoch {epoch:03d} | LR: {lr:.6f} | "
+                    f"Train Loss: {train_loss:.4f} (Recon: {sum_recon/len(train_loader):.4f}, "
+                    f"KL: {sum_kl/len(train_loader):.4f}, Cov: {sum_cov/len(train_loader):.4f}, "
+                    f"Sign: {sum_sign/len(train_loader):.4f}, MMD: {sum_mmd/len(train_loader):.4f}) | "
+                    f"Val Loss: {val_loss:.4f}"
+                )
 
     def generate(self, n: int) -> pd.DataFrame:
         self.model.eval()
