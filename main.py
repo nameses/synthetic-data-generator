@@ -5,6 +5,7 @@ from typing import Dict, Optional
 import logging
 
 from data_generation.dataset_loader import DatasetLoader
+from data_generation.vae import VAEPipeline, VAEConfig
 from data_generation.wgan import WGAN
 
 from analytics.report_generator import generate_report
@@ -84,7 +85,7 @@ metadata_adult = {
 
 def main():
     try:
-        synthetic_size = 20_000
+        synthetic_size = 10_000
 
         # define metadata
         metadata = metadata_airline
@@ -97,12 +98,16 @@ def main():
             # data_path='datasets/healthcare_dataset.csv',
             # data_path='datasets/adult.csv',
             metadata=metadata
-        ).head(40_000)
+        ).head(50_000)
 
-        generator = WGAN(real=real_data, meta=metadata, cfg=GanConfig())
+        # generator = WGAN(real=real_data, meta=metadata, cfg=GanConfig())
+        # generator.fit()
+        # synthetic_data = generator.generate(synthetic_size)
 
-        generator.fit()
-        synthetic_data = generator.generate(synthetic_size)
+        vae = VAEPipeline(df=real_data, meta=metadata, cfg=VAEConfig())
+        vae.train()
+        synthetic_data = vae.generate(synthetic_size)
+
         logger.info(f"Generated synthetic data with shape: {synthetic_data.shape}")
 
         # generate comparison

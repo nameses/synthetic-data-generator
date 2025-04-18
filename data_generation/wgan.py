@@ -1,6 +1,11 @@
 """
-Advanced WGAN‑GP for tabular data
-(now with adaptive n_critic, separate critic width, pure cosine LR)
+Improved WGAN‑GP for tabular data
+================================
+• λ (GP‑weight) lowered to 2.5 because spectral‑norm is used
+• ε‑drift penalty keeps critic outputs bounded without mean‑centering
+• Numeric transformer clips 0.5 / 99.5 % tails before rank‑gauss
+• Adaptive n_critic: 5 steps while |W| < 0.02, otherwise 1
+• Separate Wasserstein estimate + losses in the log line
 """
 
 from __future__ import annotations
@@ -26,7 +31,15 @@ from torch.utils.data import DataLoader, TensorDataset
 from models.enums import DataType
 from models.field_metadata import FieldMetadata
 
+
+# main.py  – after logging.basicConfig(...)
+from datetime import datetime
+ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+fh = logging.FileHandler(f"train_{ts}.log", mode="w", encoding="utf‑8")
+fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+
 LOGGER = logging.getLogger(__name__)
+LOGGER.addHandler(fh)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 amp_autocast = lambda: torch.amp.autocast("cuda", enabled=True)
 
@@ -38,18 +51,18 @@ amp_autocast = lambda: torch.amp.autocast("cuda", enabled=True)
 @dataclass(slots=True)
 class GanConfig:
     latent_dim: int = 128
-    hidden_g: int = 512          # generator width
-    hidden_d: int = 384          # critic width
+    hidden_g: int = 512
+    hidden_d: int = 384
     batch_size: int = 256
-    n_critic_initial: int = 5
-    critic_phase_epochs: int = 20   # after this, n_critic -> 1
-    gp_weight: float = 5.0
+    n_critic_initial: int = 5          # starting value (adaptive afterwards)
+    gp_weight: float = 4.0            # ← lower GP because of spectral‑norm
+    drift_epsilon: float = 5e-4        # critic drift penalty ε‖D(x)‖²
     g_lr: float = 2e-4
     d_lr: float = 4e-4
-    max_epochs: int = 400
+    max_epochs: int = 300
     seed: int = 42
     # cosine schedule
-    lr_min_ratio: float = 0.05   # final_lr = lr * ratio
+    lr_min_ratio: float = 0.05
     # early stop
     patience: int = 150
     # gumbel
@@ -69,8 +82,12 @@ class _BaseTf:
 
 
 class _ContTf(_BaseTf):
+    """Rank‑gauss with light tail‑clipping for stability."""
+
     def fit(self, s):
-        self.sorted_ = np.sort(s.to_numpy(copy=True));  return self
+        q_low, q_hi = s.quantile([0.0025, 0.9975])
+        self.sorted_ = np.sort(s.clip(q_low, q_hi).to_numpy(copy=True))
+        return self
 
     def transform(self, s):
         u = rankdata(s, method="average") / (len(s) + 1)
@@ -128,6 +145,7 @@ class _Generator(nn.Module):
     def forward(self, z, cond_vec, hard=False):
         h = self.backbone(torch.cat([z, cond_vec], 1))
         out = [self.num_head(h)] if self.num_head else []
+        # cosine‑annealed Gumbel τ
         tau = self.cfg.tau_end + 0.5 * (self.cfg.tau_start - self.cfg.tau_end) * (
             1 + math.cos(math.pi * self.step.item() / self.total_steps)
         )
@@ -144,9 +162,9 @@ class _Discriminator(nn.Module):
         self.net = nn.Sequential(
             lin_sn(inp_dim + cond_dim, hid),
             nn.LeakyReLU(0.2),
-            lin_sn(hid, hid // 1),     # same width
+            lin_sn(hid, hid),
             nn.LeakyReLU(0.2),
-            lin_sn(hid // 1, hid // 2),
+            lin_sn(hid, hid // 2),
             nn.LeakyReLU(0.2),
             lin_sn(hid // 2, 1),
         )
@@ -164,13 +182,20 @@ class WGAN:
         self.cfg, self.meta, self.faker = cfg, meta, Faker()
         _set_seed(cfg.seed)
 
+        self.W_smooth = None  # running abs Wasserstein
+        self.n_critic = 5  # start conservatively
+
         # ------------ column groups & transformers --------------
         self.num_cols, self.dt_cols, self.cat_cols, self.str_cols = [], [], [], []
         for c, m in meta.items():
-            if m.data_type in {DataType.INTEGER, DataType.DECIMAL}:   self.num_cols.append(c)
-            elif m.data_type is DataType.DATETIME:                    self.dt_cols.append(c)
-            elif m.data_type in {DataType.CATEGORICAL, DataType.BOOLEAN}: self.cat_cols.append(c)
-            elif m.data_type is DataType.STRING:                      self.str_cols.append(c)
+            if m.data_type in {DataType.INTEGER, DataType.DECIMAL}:
+                self.num_cols.append(c)
+            elif m.data_type is DataType.DATETIME:
+                self.dt_cols.append(c)
+            elif m.data_type in {DataType.CATEGORICAL, DataType.BOOLEAN}:
+                self.cat_cols.append(c)
+            elif m.data_type is DataType.STRING:
+                self.str_cols.append(c)
 
         self.tfs: Dict[str, _BaseTf] = {}; mats = []
 
@@ -208,39 +233,48 @@ class WGAN:
 
         self.ema_G = copy.deepcopy(self.G).eval().requires_grad_(False)
         self.ema_beta, self.best_w, self.no_imp = 0.999, -float("inf"), 0
-        self.n_critic = cfg.n_critic_initial  # adaptive
+        self.n_critic = cfg.n_critic_initial
 
     # ------------------------------------------------------------------#
     def fit(self):
         for epoch in range(1, self.cfg.max_epochs + 1):
-            d_sum = g_sum = 0.0
-
-            # adapt n_critic after critic_phase_epochs
-            if epoch == self.cfg.critic_phase_epochs + 1:
-                self.n_critic = 1
-                for pg in self.opt_d.param_groups:
-                    pg["lr"] *= 0.5
-                LOGGER.info("Switched to n_critic = 1 after epoch %d", self.cfg.critic_phase_epochs)
+            d_sum = g_sum = w_sum = 0.0
 
             for i, (real,) in enumerate(self.loader, 1):
                 real = real.to(DEVICE)
                 cond = self._sample_cond(real.size(0)).to(DEVICE)
-                d_sum += self._train_d(real, cond).item()
+                w_est = self._train_d(real, cond)
+                d_sum += w_est[1]; w_sum += w_est[0]
 
                 g_loss = torch.tensor(0.0, device=DEVICE)
                 if i % self.n_critic == 0:
                     g_loss = self._train_g(real.size(0), cond)
                     g_sum += g_loss.item()
 
-                if any(torch.isnan(x) | torch.isinf(x) for x in (g_loss,)):
-                    LOGGER.error("NaN/Inf detected – abort");  return
+            # adaptive n_critic
+            mean_W = w_sum / len(self.loader)
+            alpha = 0.9
+            self.W_smooth = (mean_W if self.W_smooth is None
+                             else alpha * self.W_smooth + (1 - alpha) * mean_W)
+
+            # three‑level hysteresis
+            if self.W_smooth < 0.015 and self.n_critic < 5:
+                self.n_critic += 1
+            elif self.W_smooth > 0.04 and self.n_critic > 1:
+                self.n_critic -= 1
 
             # LR decay
             self.sch_g.step(); self.sch_d.step()
 
             g_mean = g_sum / max(1, len(self.loader) / self.n_critic)
             d_mean = d_sum / len(self.loader)
-            LOGGER.info("Epoch %03d | D %.4f | G %.4f | n_c %d", epoch, d_mean, g_mean, self.n_critic)
+
+            lr_d = self.opt_d.param_groups[0]["lr"]
+            lr_g = self.opt_g.param_groups[0]["lr"]
+            LOGGER.info(
+                "Ep %03d | W %.4f | D %.4f | G %.4f | n_c %d | lr_d %.6f | lr_g %.6f",
+                epoch, mean_W, d_mean, g_mean, self.n_critic, lr_d, lr_g
+            )
 
             # EMA‑Wasserstein early stop
             w_est = -d_mean
@@ -265,8 +299,10 @@ class WGAN:
         mat = np.vstack(rows)[:n]
 
         ptr, data = 0, {}
-        for c in self.num_cols: data[c] = self.tfs[c].inverse(mat[:, ptr]); ptr += 1
-        for c in self.dt_cols: data[c] = self.tfs[c].inverse(mat[:, ptr]); ptr += 1
+        for c in self.num_cols:
+            data[c] = self.tfs[c].inverse(mat[:, ptr]); ptr += 1
+        for c in self.dt_cols:
+            data[c] = self.tfs[c].inverse(mat[:, ptr]); ptr += 1
         for c, k in zip(self.cat_cols, self.cat_sizes):
             idx = mat[:, ptr:ptr + k].argmax(1); ptr += k
             inv = {v: k for k, v in self.cat_maps[c].items()}
@@ -284,12 +320,19 @@ class WGAN:
         z = torch.randn(real.size(0), self.cfg.latent_dim, device=DEVICE)
         fake = self.G(z, cond).detach()
         with amp_autocast():
+            d_real = self.D(real, cond)
+            d_fake = self.D(fake, cond)
             gp = self._gp(real, fake, cond)
-            loss = self.D(fake, cond).mean() - self.D(real, cond).mean() + self.cfg.gp_weight * gp
+
+            # Wasserstein estimate & full loss
+            w_est = d_real.mean() - d_fake.mean()
+            loss = -w_est + self.cfg.gp_weight * gp
+            loss += self.cfg.drift_epsilon * (d_real.pow(2).mean() + d_fake.pow(2).mean())
+
         self.scaler_d.scale(loss).backward()
         self.scaler_d.step(self.opt_d)
         self.scaler_d.update()
-        return loss
+        return w_est.item(), loss.item()
 
     def _train_g(self, bsz, cond):
         self.opt_g.zero_grad(set_to_none=True)
@@ -297,7 +340,9 @@ class WGAN:
         with amp_autocast():
             loss = -self.D(self.G(z, cond), cond).mean()
         self.scaler_g.scale(loss).backward()
-        self.scaler_g.step(self.opt_g); self.scaler_g.update()
+        self.scaler_g.step(self.opt_g)
+        self.scaler_g.update()
+        # EMA
         with torch.no_grad():
             for p, p_ema in zip(self.G.parameters(), self.ema_G.parameters()):
                 p_ema.mul_(self.ema_beta).add_(p.data, alpha=1 - self.ema_beta)
@@ -305,22 +350,26 @@ class WGAN:
 
     # ------------------------------------------------------------------#
     def _sample_cond(self, bsz):
-        if not self.cat_cols: return torch.zeros(bsz, 0, device=DEVICE)
+        if not self.cat_cols:
+            return torch.zeros(bsz, 0, device=DEVICE)
         cond = torch.zeros(bsz, sum(self.cat_sizes), device=DEVICE)
         off = 0
         for k in self.cat_sizes:
             idx = np.random.randint(k, size=bsz)
-            cond[range(bsz), off + idx] = 1.0;  off += k
+            cond[range(bsz), off + idx] = 1.0
+            off += k
         return cond
 
     def _gp(self, real, fake, cond):
         alpha = torch.rand(real.size(0), 1, device=DEVICE)
         mix = (alpha * real + (1 - alpha) * fake).requires_grad_(True)
-        with amp_autocast(): score = self.D(mix, cond)
+        with amp_autocast():
+            score = self.D(mix, cond)
         grad = torch.autograd.grad(score.sum(), mix, create_graph=True)[0]
         return ((grad.view(grad.size(0), -1).norm(2, 1) - 1) ** 2).mean()
 
 
 def _set_seed(s):
     random.seed(s); np.random.seed(s); torch.manual_seed(s)
-    if torch.cuda.is_available(): torch.cuda.manual_seed_all(s)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(s)

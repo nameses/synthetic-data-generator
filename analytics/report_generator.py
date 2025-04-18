@@ -147,8 +147,11 @@ def generate_report(
             summary.append(f"{col:30s}| W-dist {w:7.3f}")
 
             fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-            sns.kdeplot(r, ax=axes[0], label="Real", linewidth=2)
-            sns.kdeplot(s, ax=axes[0], label="Synthetic", linewidth=2)
+            # only plot KDE if there's non-zero variance
+            if r.nunique() > 1:
+                sns.kdeplot(r, ax=axes[0], label="Real", linewidth=2)
+            if s.nunique() > 1:
+                sns.kdeplot(s, ax=axes[0], label="Synthetic", linewidth=2)
             axes[0].set_title(col + " - KDE")
             axes[0].legend()
 
@@ -223,7 +226,15 @@ def generate_report(
         real_corr = real_num.corr()
         synth_corr = synth_num.corr()
         diff_corr = real_corr - synth_corr
-        mae_corr = mean_absolute_error(real_corr.values.flatten(), synth_corr.values.flatten())
+
+        # mask out any NaNs before MAE
+        r_vals = real_corr.values.flatten()
+        s_vals = synth_corr.values.flatten()
+        mask = ~np.isnan(r_vals) & ~np.isnan(s_vals)
+        if mask.any():
+            mae_corr = mean_absolute_error(r_vals[mask], s_vals[mask])
+        else:
+            mae_corr = np.nan
         summary.extend(["", f"MAE of Pearson correlations (num+dt): {mae_corr:.4f}"])
 
         fig, axes = plt.subplots(1, 3, figsize=(18, 5))
