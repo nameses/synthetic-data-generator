@@ -64,7 +64,7 @@ class GanConfig:
     # cosine schedule
     lr_min_ratio: float = 0.05
     # early stop
-    patience: int = 150
+    patience: int = 200
     # gumbel
     tau_start: float = 2.5
     tau_end: float = 0.25
@@ -212,6 +212,16 @@ class WGAN:
             mats.append(F.one_hot(torch.tensor(real[c].astype(str).map(mp).values),
                                   num_classes=len(uniq)).T.numpy())
 
+        # --- compute per-col sampling probs for any cat flagged 'empirical' ---
+        self.cat_probs: dict[str, np.ndarray] = {}
+        for c, size in zip(self.cat_cols, self.cat_sizes):
+            m = meta[c]
+            if m.sampling == "empirical":
+                # map real values → integer indices
+                inv = real[c].astype(str).map(self.cat_maps[c])
+                counts = inv.value_counts().sort_index()
+                self.cat_probs[c] = (counts / counts.sum()).values
+
         X = torch.tensor(np.vstack(mats).T, dtype=torch.float32)
         self.loader = DataLoader(TensorDataset(X), cfg.batch_size, shuffle=True, drop_last=True)
         LOGGER.info("Real tensor %s", X.shape)
@@ -356,8 +366,14 @@ class WGAN:
             return torch.zeros(bsz, 0, device=DEVICE)
         cond = torch.zeros(bsz, sum(self.cat_sizes), device=DEVICE)
         off = 0
-        for k in self.cat_sizes:
-            idx = np.random.randint(k, size=bsz)
+        for c, k in zip(self.cat_cols, self.cat_sizes):
+            if c in self.cat_probs:
+                # empirical sampling
+                p = self.cat_probs[c]
+                idx = np.random.choice(k, size=bsz, p=p)
+            else:
+                # uniform fallback
+                idx = np.random.randint(k, size=bsz)
             cond[range(bsz), off + idx] = 1.0
             off += k
         return cond

@@ -1,26 +1,18 @@
-# %% [markdown]
-# ## 1. Imports & Config
+#!/usr/bin/env python3
+# prediction_real_only_scaling.py
 
-# %%
 import pandas as pd
+import numpy as np
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
 from sklearn.neural_network import MLPClassifier
 from sklearn.metrics import accuracy_score, classification_report
-from sklearn.utils import shuffle
 
-# %%
-# — configure your file paths here:
+# ───── 1. CONFIG ─────
 ORIGINAL_PATH = "../datasets/airline-passenger-satisfaction.csv"
-SYNTH_PATHS = [
-    "gan-synthetic-cutted.csv",
-    # "gan-synthetic.csv",
-    # "vae-synthetic.csv",
-]
+SYNTH_PATH = "gan-synthetic.csv"
 
-# numeric vs categorical columns
 NUM_FEATS = [
     "Age",
     # "Flight Distance",
@@ -38,40 +30,15 @@ NUM_FEATS = [
     "Checkin service",
     "Inflight service",
     "Cleanliness",
+    # you may include delays if you like:
     # "Departure Delay in Minutes",
     # "Arrival Delay in Minutes"
 ]
 CAT_FEATS = ["Gender", "Customer Type", "Type of Travel", "Class"]
 
-
-# helper to build a fresh pipeline
-def build_pipeline():
-    preproc = ColumnTransformer([
-        ("num", StandardScaler(), NUM_FEATS),
-        ("cat", OneHotEncoder(handle_unknown="ignore"), CAT_FEATS),
-    ])
-    return Pipeline([
-        ("preproc", preproc),
-        ("mlp", MLPClassifier(
-            hidden_layer_sizes=(128, 64, 32),
-            activation="relu",
-            solver="adam",
-            max_iter=500,
-            tol=1e-4,
-            early_stopping=True,
-            validation_fraction=0.1,
-            n_iter_no_change=100,
-            verbose=False,
-            random_state=42
-        ))
-    ])
-
-
-# %% [markdown]
-# ## 2. Load & Split Original Data
-
-# %%
+# ───── 2. LOAD & SPLIT ORIGINAL DATA ─────
 df_orig = pd.read_csv(ORIGINAL_PATH).dropna()
+# map labels to 0/1
 df_orig["satisfaction"] = df_orig["satisfaction"].map({
     "satisfied": 1,
     "neutral or dissatisfied": 0
@@ -81,76 +48,63 @@ X = df_orig.drop("satisfaction", axis=1)
 y = df_orig["satisfaction"]
 
 X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, stratify=y, random_state=42
+    X, y,
+    test_size=0.2,
+    stratify=y,
+    random_state=42
 )
 
-# %% [markdown]
-# ## 3. (A) Train on Original Only
+# ───── 3. FIT PREPROCESSOR ON REAL DATA ONLY ─────
+preproc = ColumnTransformer([
+    ("num", StandardScaler(), NUM_FEATS),
+    ("cat", OneHotEncoder(handle_unknown="ignore"), CAT_FEATS),
+])
+preproc.fit(X_train)  # <-- only real data!
 
-# %%
-print("### Training on ORIGINAL only\n")
-pipe = build_pipeline()
-pipe.fit(X_train, y_train)
-y_pred = pipe.predict(X_test)
+# ───── 4. TRANSFORM REAL + SYNTHETIC ─────
+# 4.1 real
+X_train_real_scaled = preproc.transform(X_train)
+
+# 4.2 synthetic
+df_synth = pd.read_csv(SYNTH_PATH)
+df_synth["satisfaction"] = df_synth["satisfaction"].map({
+    "satisfied": 1,
+    "neutral or dissatisfied": 0
+})
+X_synth = df_synth.drop("satisfaction", axis=1)
+y_synth = df_synth["satisfaction"]
+
+X_synth_scaled = preproc.transform(X_synth)
+
+# ───── 5. STACK & SHUFFLE ─────
+X_aug = np.vstack([X_train_real_scaled, X_synth_scaled])
+y_aug = np.concatenate([y_train.values, y_synth.values])
+
+# optional: shuffle
+from sklearn.utils import shuffle
+
+X_aug, y_aug = shuffle(X_aug, y_aug, random_state=42)
+
+# ───── 6. TRAIN CLASSIFIER ─────
+mlp = MLPClassifier(
+    hidden_layer_sizes=(128, 64, 32),
+    activation="relu",
+    solver="adam",
+    max_iter=500,
+    tol=1e-4,
+    early_stopping=True,
+    validation_fraction=0.1,
+    n_iter_no_change=100,
+    random_state=42,
+    verbose=False
+)
+mlp.fit(X_aug, y_aug)
+
+# ───── 7. EVALUATE ON REAL TEST SET ─────
+X_test_scaled = preproc.transform(X_test)
+y_pred = mlp.predict(X_test_scaled)
 
 print(f"Accuracy: {accuracy_score(y_test, y_pred):.4f}\n")
-print(classification_report(y_test, y_pred, target_names=["dissatisfied", "satisfied"]))
-
-# %% [markdown]
-# ## 3. (B) Train on Original + Synthetic Sets
-
-# %%
-for synth_path in SYNTH_PATHS:
-    name = synth_path.rsplit("/", 1)[-1]
-    # load & map
-    df_s = pd.read_csv(synth_path)
-    df_s["satisfaction"] = df_s["satisfaction"].map({
-        "satisfied": 1,
-        "neutral or dissatisfied": 0
-    })
-    X_s, y_s = df_s.drop("satisfaction", axis=1), df_s["satisfaction"]
-    # augment only train set
-    X_train_aug = pd.concat([X_train, X_s], ignore_index=True)
-    y_train_aug = pd.concat([y_train, y_s], ignore_index=True)
-    X_train_aug, y_train_aug = shuffle(X_train_aug, y_train_aug, random_state=42)
-
-    print(f"\n### Training on ORIGINAL + {name}\n")
-    pipe = build_pipeline()
-    pipe.fit(X_train_aug, y_train_aug)
-    y_pred = pipe.predict(X_test)
-
-    print(f"Accuracy: {accuracy_score(y_test, y_pred):.4f}\n")
-    print(classification_report(y_test, y_pred, target_names=["dissatisfied", "satisfied"]))
-# %% [markdown]
-# ### 4. Compare “no mix” vs. “mixed” for each synthetic set
-
-# %%
-# from sklearn.utils import shuffle
-#
-# def eval_train(X_tr, y_tr, X_te, y_te):
-#     pipe = build_pipeline()
-#     pipe.fit(X_tr, y_tr)
-#     y_pred = pipe.predict(X_te)
-#     return accuracy_score(y_te, y_pred)
-#
-# for synth_path in SYNTH_PATHS:
-#     name = synth_path.rsplit("/", 1)[-1]
-#     # load & encode
-#     df_s = pd.read_csv(synth_path)
-#     df_s["satisfaction"] = df_s["satisfaction"].map({"satisfied":1, "neutral or dissatisfied":0})
-#     X_s, y_s = df_s.drop("satisfaction", axis=1), df_s["satisfaction"]
-#
-#     # augment original train
-#     X_aug = pd.concat([X_train, X_s], ignore_index=True)
-#     y_aug = pd.concat([y_train, y_s], ignore_index=True)
-#
-#     # 1) NO SHUFFLE
-#     acc_nomix = eval_train(X_aug, y_aug, X_test, y_test)
-#
-#     # 2) SHUFFLE (“mix up”)
-#     X_mix, y_mix = shuffle(X_aug, y_aug, random_state=42)
-#     acc_mix   = eval_train(X_mix, y_mix, X_test, y_test)
-#
-#     print(f"\n**{name}**")
-#     print(f" • No mix   Accuracy: {acc_nomix:.4f}")
-#     print(f" • Mixed    Accuracy: {acc_mix:.4f}")
+print(classification_report(
+    y_test, y_pred, target_names=["dissatisfied", "satisfied"]
+))
