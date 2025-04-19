@@ -21,13 +21,13 @@ class VAEConfig:
     def __init__(
         self,
         latent_dim: int = 512,
-        hidden_dims: List[int] = [256, 512, 1024, 512, 256, 128],
+        hidden_dims: List[int] = [256, 512, 1024, 1024, 512, 256],
         batch_size: int = 512,
         lr: float = 1e-3,
         weight_decay: float = 1e-5,
-        epochs: int = 120,
+        epochs: int = 300,
         beta_kl: float = 1.0,
-        lambda_corr: float = 1.0,
+        lambda_corr: float = 0.75,
         lambda_mmd: float = 5.0,
         scheduler_type: str = 'cosine',  # 'cosine' or 'plateau'
         device: str = None
@@ -176,6 +176,16 @@ class VAEPipeline:
                       f" (Recon:{sum_losses['recon']/len(train_loader):.4f}, KL:{sum_losses['kl']/len(train_loader):.4f},"
                       f" Corr:{sum_losses['corr']/len(train_loader):.4f}, MMD:{sum_losses['mmd']/len(train_loader):.4f}) | Val Loss:{val_loss:.4f}")
 
+    def _postprocess(self, df: pd.DataFrame) -> pd.DataFrame:
+        # Round every decimal column to its metadata-defined precision
+        for c in self.num_cols:
+            if self.meta[c].data_type == DataType.DECIMAL:
+                # default to 2 if decimal_places is None or zero
+                decimals = getattr(self.meta[c], 'decimal_places', None) or 2
+                df[c] = df[c].round(decimals)
+        return df[list(self.meta.keys())]
+
+
     def generate(self, n:int)->pd.DataFrame:
         self.model.eval()
         with torch.no_grad():
@@ -208,4 +218,4 @@ class VAEPipeline:
         for c in self.str_cols:
             method=self.meta[c].faker_method or self.cfg.faker.word; args=self.meta[c].faker_args
             data[c]=[method(**args) if callable(method) else method for _ in range(n)]
-        return pd.DataFrame(data)
+        return self._postprocess(pd.DataFrame(data))

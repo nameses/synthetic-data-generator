@@ -85,7 +85,7 @@ metadata_adult = {
 
 def main():
     try:
-        synthetic_size = 10_000
+        synthetic_size = 100_000
 
         # define metadata
         metadata = metadata_airline
@@ -98,15 +98,15 @@ def main():
             # data_path='datasets/healthcare_dataset.csv',
             # data_path='datasets/adult.csv',
             metadata=metadata
-        ).head(50_000)
+        )#.head(50_000)
 
-        # generator = WGAN(real=real_data, meta=metadata, cfg=GanConfig())
-        # generator.fit()
-        # synthetic_data = generator.generate(synthetic_size)
+        generator = WGAN(real=real_data, meta=metadata, cfg=GanConfig())
+        generator.fit()
+        synthetic_data = generator.generate(synthetic_size)
 
-        vae = VAEPipeline(df=real_data, meta=metadata, cfg=VAEConfig())
-        vae.train()
-        synthetic_data = vae.generate(synthetic_size)
+        # vae = VAEPipeline(df=real_data, meta=metadata, cfg=VAEConfig())
+        # vae.train()
+        # synthetic_data = vae.generate(synthetic_size)
 
         logger.info(f"Generated synthetic data with shape: {synthetic_data.shape}")
 

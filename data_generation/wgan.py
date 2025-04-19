@@ -54,9 +54,9 @@ class GanConfig:
     hidden_g: int = 512
     hidden_d: int = 384
     batch_size: int = 256
-    n_critic_initial: int = 5          # starting value (adaptive afterwards)
-    gp_weight: float = 4.0            # ← lower GP because of spectral‑norm
-    drift_epsilon: float = 5e-4        # critic drift penalty ε‖D(x)‖²
+    n_critic_initial: int = 5
+    gp_weight: float = 4.0
+    drift_epsilon: float = 5e-4
     g_lr: float = 2e-4
     d_lr: float = 4e-4
     max_epochs: int = 300
@@ -310,7 +310,9 @@ class WGAN:
         for c in self.str_cols:
             meta = self.meta[c]; fn: Callable = meta.faker_method or self.faker.word
             data[c] = [fn(**(meta.faker_args or {})) for _ in range(n)]
-        return pd.DataFrame(data)[list(self.meta.keys())]
+
+        df = pd.DataFrame(data)
+        return df[list(self.meta.keys())]
 
     # ------------------------------------------------------------------#
     # TRAIN HELPERS
