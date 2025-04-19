@@ -6,10 +6,10 @@ from models.field_metadata import FieldMetadata
 metadata_airline = {
     'Gender': FieldMetadata(DataType.CATEGORICAL, sampling='empirical'),
     'Customer Type': FieldMetadata(DataType.CATEGORICAL, sampling='empirical'),
-    'Age': FieldMetadata(DataType.INTEGER),
+    'Age': FieldMetadata(DataType.INTEGER, transformer="standard", match_moments=True),
     'Type of Travel': FieldMetadata(DataType.CATEGORICAL, sampling='empirical'),
     'Class': FieldMetadata(DataType.CATEGORICAL, sampling='empirical'),
-    'Flight Distance': FieldMetadata(DataType.INTEGER),
+    'Flight Distance': FieldMetadata(DataType.INTEGER, transformer="log", match_moments=True),
     'Inflight wifi service': FieldMetadata(DataType.INTEGER),
     'Departure or Arrival time convenient': FieldMetadata(DataType.INTEGER),
     'Ease of Online booking': FieldMetadata(DataType.INTEGER),
@@ -24,9 +24,9 @@ metadata_airline = {
     'Checkin service': FieldMetadata(DataType.INTEGER),
     'Inflight service': FieldMetadata(DataType.INTEGER),
     'Cleanliness': FieldMetadata(DataType.INTEGER),
-    'Departure Delay in Minutes': FieldMetadata(DataType.INTEGER),
-    'Arrival Delay in Minutes': FieldMetadata(DataType.DECIMAL, decimal_places=1),
-    'satisfaction': FieldMetadata(DataType.CATEGORICAL, sampling='empirical'),
+    'Departure Delay in Minutes': FieldMetadata(DataType.INTEGER, transformer="log", match_moments=True),
+    'Arrival Delay in Minutes': FieldMetadata(DataType.DECIMAL, decimal_places=1, transformer="log", match_moments=True),
+    'satisfaction': FieldMetadata(DataType.CATEGORICAL, sampling='empirical', is_prediction_used=True),
 }
 
 metadata_helthcare = {
@@ -63,4 +63,16 @@ metadata_adult = {
     'hours.per.week': FieldMetadata(DataType.INTEGER),
     'native.country': FieldMetadata(DataType.CATEGORICAL),
     'income': FieldMetadata(DataType.CATEGORICAL)
+}
+
+metadata_power_consumption = {
+    'Date': FieldMetadata(DataType.DATETIME, datetime_format='%d/%m/%Y'),
+    'Time': FieldMetadata(DataType.DATETIME, datetime_format='%H:%M:%S'),
+    'Global_active_power': FieldMetadata(DataType.DECIMAL, decimal_places=3),
+    'Global_reactive_power': FieldMetadata(DataType.DECIMAL, decimal_places=3),
+    'Voltage': FieldMetadata(DataType.DECIMAL, decimal_places=3),
+    'Global_intensity': FieldMetadata(DataType.DECIMAL, decimal_places=3),
+    'Sub_metering_1': FieldMetadata(DataType.DECIMAL, decimal_places=3),
+    'Sub_metering_2': FieldMetadata(DataType.DECIMAL, decimal_places=3),
+    'Sub_metering_3': FieldMetadata(DataType.DECIMAL, decimal_places=3)
 }

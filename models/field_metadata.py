@@ -21,12 +21,21 @@ class FieldMetadata:
 
             # datetime fields
             datetime_format: Optional[str] = None,
+
+            is_prediction_used: bool = False,
+            transformer: Optional[str] = None, # "standard"
+            match_moments: bool = False,
     ):
         self.data_type = data_type
         self.decimal_places = decimal_places
+
+        self.sampling = sampling
 
         self.faker_method = faker_method
         self.faker_args = faker_args or {}
 
         self.datetime_format = datetime_format
-        self.sampling = sampling
+
+        self.is_prediction_used = is_prediction_used
+        self.transformer = transformer
+        self.match_moments = match_moments

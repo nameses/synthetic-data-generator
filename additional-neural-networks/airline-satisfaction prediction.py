@@ -11,11 +11,11 @@ from sklearn.metrics import accuracy_score, classification_report
 
 # ───── 1. CONFIG ─────
 ORIGINAL_PATH = "../datasets/airline-passenger-satisfaction.csv"
-SYNTH_PATH = "gan-synthetic.csv"
+SYNTH_PATH = "synthetic.csv"
 
 NUM_FEATS = [
     "Age",
-    # "Flight Distance",
+    "Flight Distance",
     "Inflight wifi service",
     "Departure or Arrival time convenient",
     "Ease of Online booking",
@@ -30,14 +30,14 @@ NUM_FEATS = [
     "Checkin service",
     "Inflight service",
     "Cleanliness",
-    # you may include delays if you like:
-    # "Departure Delay in Minutes",
-    # "Arrival Delay in Minutes"
+    "Departure Delay in Minutes",
+    "Arrival Delay in Minutes"
 ]
 CAT_FEATS = ["Gender", "Customer Type", "Type of Travel", "Class"]
 
 # ───── 2. LOAD & SPLIT ORIGINAL DATA ─────
 df_orig = pd.read_csv(ORIGINAL_PATH).dropna()
+df_orig.describe(include="all").to_csv('df_orig.csv')
 # map labels to 0/1
 df_orig["satisfaction"] = df_orig["satisfaction"].map({
     "satisfied": 1,
@@ -59,7 +59,7 @@ preproc = ColumnTransformer([
     ("num", StandardScaler(), NUM_FEATS),
     ("cat", OneHotEncoder(handle_unknown="ignore"), CAT_FEATS),
 ])
-preproc.fit(X_train)  # <-- only real data!
+preproc.fit(X_train)
 
 # ───── 4. TRANSFORM REAL + SYNTHETIC ─────
 # 4.1 real
@@ -67,6 +67,8 @@ X_train_real_scaled = preproc.transform(X_train)
 
 # 4.2 synthetic
 df_synth = pd.read_csv(SYNTH_PATH)
+df_synth.describe(include="all").to_csv("df_synth.csv")
+
 df_synth["satisfaction"] = df_synth["satisfaction"].map({
     "satisfied": 1,
     "neutral or dissatisfied": 0

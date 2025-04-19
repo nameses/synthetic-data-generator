@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 def main():
     try:
-        synthetic_size = 70_000
+        synthetic_size = 50_000
 
         # define metadata
         metadata = metadata_airline
@@ -37,10 +37,10 @@ def main():
             # data_path='datasets/healthcare_dataset.csv',
             # data_path='datasets/adult.csv',
             metadata=metadata
-        )#.head(50_000)
+        )  # .head(40_000)
 
-        generator = WGAN(real=real_data, meta=metadata, cfg=GanConfig())
-        generator.fit()
+        generator = WGAN(real=real_data, meta=metadata, cfg=GanConfig(max_epochs=200, patience=200))
+        generator.fit(True)
         synthetic_data = generator.generate(synthetic_size)
 
         # vae = VAEPipeline(df=real_data, meta=metadata, cfg=VAEConfig())

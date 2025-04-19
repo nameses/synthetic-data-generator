@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 from typing import Dict, List
 
+import numpy as np
 import pandas as pd
 
 from models.enums import DataType
@@ -61,6 +62,11 @@ class DatasetLoader:
             100 * (before - len(df)) / max(before, 1),
             df.shape,
         )
+
+        # log-transform any flagged columns
+        for col, m in metadata.items():
+            if m.data_type in {DataType.INTEGER, DataType.DECIMAL} and getattr(m, "log_transform", False):
+                df[col] = np.log1p(df[col])
 
         if sample_size is not None and len(df) > sample_size:
             df = df.sample(sample_size, random_state=42).reset_index(drop=True)

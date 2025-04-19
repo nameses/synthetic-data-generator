@@ -87,11 +87,19 @@ def generate_report(real: pd.DataFrame, synth: pd.DataFrame, meta: Dict[str, Fie
             ks_stat, _ = ks_2samp(r, s)
             summary_lines.append(f"{col:30}| W-dist {w_dist:.3f} | KS {ks_stat:.3f}")
 
-            fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-            sns.kdeplot(r, ax=axes[0], label="Real", lw=2)
-            sns.kdeplot(s, ax=axes[0], label="Synthetic", lw=2)
+            fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+            bins = min(100, int(np.sqrt(len(r))))
+            axes[0].hist(r, bins=bins, density=True, alpha=0.8, label="Real", color="tab:blue")
+            axes[0].hist(s, bins=bins, density=True, alpha=0.8, label="Synthetic", color="tab:orange")
+            axes[0].set_title("Distribution Comparison", fontsize=12)
             axes[0].legend()
-            axes[0].set_title(f"KDE: {col}")
+            axes[0].set_ylabel("Density")
+
+            # sns.kdeplot(r, ax=axes[0], label="Real", lw=2)
+            # sns.kdeplot(s, ax=axes[0], label="Synthetic", lw=2)
+            # axes[0].legend()
+            # axes[0].set_title(f"KDE: {col}")
 
             probs = np.linspace(0.01, 0.99, 100)
             qr = np.quantile(r, probs)
