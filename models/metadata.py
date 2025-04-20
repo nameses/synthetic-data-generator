@@ -9,7 +9,7 @@ metadata_airline = {
     'Age': FieldMetadata(DataType.INTEGER, transformer="standard", match_moments=True),
     'Type of Travel': FieldMetadata(DataType.CATEGORICAL, sampling='empirical'),
     'Class': FieldMetadata(DataType.CATEGORICAL, sampling='empirical'),
-    'Flight Distance': FieldMetadata(DataType.INTEGER, transformer="log", match_moments=True),
+    'Flight Distance': FieldMetadata(DataType.INTEGER, transformer="gmm", match_moments=True),
     'Inflight wifi service': FieldMetadata(DataType.INTEGER),
     'Departure or Arrival time convenient': FieldMetadata(DataType.INTEGER),
     'Ease of Online booking': FieldMetadata(DataType.INTEGER),

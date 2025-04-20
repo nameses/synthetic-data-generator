@@ -39,7 +39,7 @@ def main():
             metadata=metadata
         )  # .head(40_000)
 
-        generator = WGAN(real=real_data, meta=metadata, cfg=GanConfig(max_epochs=200, patience=200))
+        generator = WGAN(real=real_data, meta=metadata, cfg=GanConfig())
         generator.fit(True)
         synthetic_data = generator.generate(synthetic_size)
 

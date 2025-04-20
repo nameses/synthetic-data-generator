@@ -63,10 +63,14 @@ class DatasetLoader:
             df.shape,
         )
 
-        # log-transform any flagged columns
+        # record min/max for numeric columns
         for col, m in metadata.items():
-            if m.data_type in {DataType.INTEGER, DataType.DECIMAL} and getattr(m, "log_transform", False):
-                df[col] = np.log1p(df[col])
+            if m.data_type in {DataType.INTEGER, DataType.DECIMAL}:
+                m.min_value = float(df[col].min())
+                m.max_value = float(df[col].max())
+                # optionally apply user-specified log_transform
+                if getattr(m, 'transformer', None) == 'log':
+                    df[col] = np.log1p(df[col])
 
         if sample_size is not None and len(df) > sample_size:
             df = df.sample(sample_size, random_state=42).reset_index(drop=True)

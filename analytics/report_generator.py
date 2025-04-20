@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from scipy.stats import ks_2samp, wasserstein_distance
+from scipy.stats import ks_2samp, wasserstein_distance, entropy, chisquare
 from sklearn.metrics import mean_absolute_error
 
 from models.enums import DataType
@@ -84,8 +84,19 @@ def generate_report(real: pd.DataFrame, synth: pd.DataFrame, meta: Dict[str, Fie
 
         if col in num_cols:
             w_dist = wasserstein_distance(r, s)
+
+            r_hist, bin_edges = np.histogram(r, bins=50, density=True)
+            s_hist, _ = np.histogram(s, bins=bin_edges, density=True)
+
+            # Add small epsilon to avoid log(0)
+            epsilon = 1e-8
+            r_hist = r_hist + epsilon
+            s_hist = s_hist + epsilon
+
+            kl_div = entropy(r_hist, s_hist)
+
             ks_stat, _ = ks_2samp(r, s)
-            summary_lines.append(f"{col:30}| W-dist {w_dist:.3f} | KS {ks_stat:.3f}")
+            summary_lines.append(f"{col:30}| W-dist {w_dist:.3f} | KS {ks_stat:.3f} | KL {kl_div:.3f}")
 
             fig, axes = plt.subplots(1, 2, figsize=(16, 6))
 
@@ -117,7 +128,14 @@ def generate_report(real: pd.DataFrame, synth: pd.DataFrame, meta: Dict[str, Fie
             real_vals = real_freq.reindex(idx, fill_value=0)
             synth_vals = synth_freq.reindex(idx, fill_value=0)
             mae = np.abs(real_vals - synth_vals).mean()
-            summary_lines.append(f"{col:30}| Cat-MAE {mae:.3f}")
+
+            real_counts = (real_vals * 10000).round().astype(int)
+            synth_counts = (synth_vals * 10000).round().astype(int)
+            try:
+                chi2, chi_p = chisquare(f_obs=synth_counts, f_exp=real_counts)
+                summary_lines.append(f"{col:30}| Cat-MAE {mae:.3f}| χ²={chi2:.2f}, p={chi_p:.4f}")
+            except Exception as e:
+                summary_lines.append(f"{col:30}| Cat-MAE {mae:.3f}| χ² test failed: {str(e)}")
 
             fig, ax = plt.subplots(figsize=(10, 4))
             width = 0.4

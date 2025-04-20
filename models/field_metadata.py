@@ -9,6 +9,9 @@ class FieldMetadata:
             data_type: DataType,
             # numerical fields
             decimal_places: Optional[int] = None,
+            # range constraints (autofilled)
+            min_value: Optional[float] = None,
+            max_value: Optional[float] = None,
 
             # categorical/boolean fields
             #  - "uniform" → np.random.randint (old behavior)
@@ -23,7 +26,7 @@ class FieldMetadata:
             datetime_format: Optional[str] = None,
 
             is_prediction_used: bool = False,
-            transformer: Optional[str] = None, # "standard"
+            transformer: Optional[str] = None,
             match_moments: bool = False,
     ):
         self.data_type = data_type
