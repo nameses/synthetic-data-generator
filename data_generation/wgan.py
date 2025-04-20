@@ -40,7 +40,8 @@ class GanConfig:
     mmd_weight: float = 3.0
     # training schedule
     pretrain_epochs: int = 10
-    max_epochs: int = 100
+    warmup_epochs: int = 15
+    max_epochs: int = 50
     eval_every: int = 5
     patience: int = 12
     # LR
@@ -290,10 +291,12 @@ class WGAN:
                 cond = self._sample_cond(real.size(0))
                 cond = cond.to(self.device)
                 d_metrics = self._train_d(real, cond, cls_w)
-                for k, v in d_metrics.items(): epoch_d[k].append(v)
+                for k, v in d_metrics.items():
+                    epoch_d[k].append(v)
                 if i % self.n_critic == 0:
                     g_metrics = self._train_g(real, cond, cls_w, mm_w, cov_w)
-                    for k, v in g_metrics.items(): epoch_g[k].append(v)
+                    for k, v in g_metrics.items():
+                        epoch_g[k].append(v)
             # scheduler step
             self.sch_g.step(); self.sch_d.step()
             # compute epoch means
@@ -316,9 +319,10 @@ class WGAN:
                     val_losses.append(self._val_step(real_val, cond_val))
                 val_loss = sum(val_losses)/len(val_losses) if val_losses else 0.0
                 self.logger.info(f"VAL Ep {epoch} | G {val_loss:.4f}")
-                if val_loss < self.best_val:
-                    self.best_val = val_loss; self.no_imp = 0
-                    self.best_weights = self.ema_G.state_dict();
+                if epoch >= self.cfg.warmup_epochs and val_loss < self.best_val:
+                    self.best_val = val_loss
+                    self.no_imp = 0
+                    self.best_weights = self.ema_G.state_dict()
                     torch.save(self.best_weights, 'best.pt')
                 else:
                     self.no_imp += 1
