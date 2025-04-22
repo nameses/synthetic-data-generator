@@ -6,10 +6,10 @@ from models.field_metadata import FieldMetadata
 metadata_airline = {
     'Gender': FieldMetadata(DataType.CATEGORICAL, sampling='empirical'),
     'Customer Type': FieldMetadata(DataType.CATEGORICAL, sampling='empirical'),
-    'Age': FieldMetadata(DataType.INTEGER, sampling='empirical', transformer = 'standard'),
+    'Age': FieldMetadata(DataType.INTEGER, sampling='empirical', transformer = 'bounded'),
     'Type of Travel': FieldMetadata(DataType.CATEGORICAL, sampling='empirical'),
     'Class': FieldMetadata(DataType.CATEGORICAL, sampling='empirical'),
-    'Flight Distance': FieldMetadata(DataType.INTEGER, sampling='empirical', transformer = 'minmax'),
+    'Flight Distance': FieldMetadata(DataType.INTEGER, sampling='empirical', transformer = 'log'),
     'Inflight wifi service': FieldMetadata(DataType.INTEGER),
     'Departure or Arrival time convenient': FieldMetadata(DataType.INTEGER),
     'Ease of Online booking': FieldMetadata(DataType.INTEGER),
@@ -24,8 +24,8 @@ metadata_airline = {
     'Checkin service': FieldMetadata(DataType.INTEGER),
     'Inflight service': FieldMetadata(DataType.INTEGER),
     'Cleanliness': FieldMetadata(DataType.INTEGER),
-    'Departure Delay in Minutes': FieldMetadata(DataType.INTEGER, sampling='empirical', transformer = 'minmax'),
-    'Arrival Delay in Minutes': FieldMetadata(DataType.DECIMAL, decimal_places=1, sampling='empirical', transformer = 'minmax'),
+    'Departure Delay in Minutes': FieldMetadata(DataType.INTEGER, sampling='empirical', transformer = 'zero_inflated'),
+    'Arrival Delay in Minutes': FieldMetadata(DataType.DECIMAL, decimal_places=1, sampling='empirical', transformer = 'zero_inflated'),
     'satisfaction': FieldMetadata(DataType.CATEGORICAL, sampling='empirical'),
 }
 

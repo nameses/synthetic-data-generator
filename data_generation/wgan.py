@@ -14,8 +14,8 @@ import copy
 import logging
 import math
 import random
-from dataclasses import dataclass
-from typing import Callable, Dict, List
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -28,6 +28,11 @@ from sklearn.model_selection import train_test_split
 from torch.nn.utils import spectral_norm
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, TensorDataset
+
+# Visualization imports
+import matplotlib.pyplot as plt
+import seaborn as sns
+from matplotlib.ticker import MaxNLocator
 
 from models.enums import DataType
 from models.field_metadata import FieldMetadata
@@ -70,6 +75,10 @@ class GanConfig:
     tau_start: float = 2.5
     tau_end: float = 0.25
     val_interval: int = 5
+    # visualization
+    plot_interval: int = 10
+    plot_samples: int = 1000
+    save_plots: bool = False
 
 
 # ------------------------------------------------------------------#
@@ -106,6 +115,150 @@ class _MinMaxTf(_BaseTf):
         raw = r * (self.max_ - self.min_) + self.min_
         return pd.Series(raw)
 
+
+class _LogTf(_BaseTf):
+    """Handles heavy-tailed distributions using log transform with offset handling"""
+
+    def fit(self, s: pd.Series):
+        # Determine the minimum value to handle zero/negative values
+        self.min_val = float(s.min())
+        self.offset = 1.0 if self.min_val >= 0.0 else 1.0 - self.min_val
+
+        # Apply log transform
+        log_vals = np.log1p(s + self.offset - self.min_val)
+        self.log_min = float(log_vals.min())
+        self.log_max = float(log_vals.max())
+        return self
+
+    def transform(self, s: pd.Series) -> np.ndarray:
+        log_vals = np.log1p(s + self.offset - self.min_val)
+        # Scale to [-1, 1] range for GAN
+        return 2 * ((log_vals - self.log_min) / (self.log_max - self.log_min)) - 1
+
+    def inverse(self, v: np.ndarray) -> pd.Series:
+        # Convert back from [-1, 1] to log space
+        log_vals = (v + 1) / 2 * (self.log_max - self.log_min) + self.log_min
+        # Convert from log space to original scale
+        raw = np.expm1(log_vals) + self.min_val - self.offset
+        return pd.Series(raw)
+
+
+class _ZeroInflatedTf(_BaseTf):
+    """Specialized for data with many zeros followed by positive values"""
+
+    def fit(self, s: pd.Series):
+        # Identify zero vs non-zero
+        self.zero_mask = (s == 0)
+        self.zero_rate = self.zero_mask.mean()
+
+        # Handle non-zero part with a standard approach
+        non_zero = s[~self.zero_mask]
+        if len(non_zero) > 0:
+            # Use log transform for the positive values
+            log_vals = np.log1p(non_zero)
+            self.log_min = float(log_vals.min())
+            self.log_max = float(log_vals.max())
+        else:
+            self.log_min, self.log_max = 0.0, 1.0
+        return self
+
+    def transform(self, s: pd.Series) -> np.ndarray:
+        # Initialize with a special value for zeros
+        result = np.zeros(len(s))
+
+        # Transform the non-zero values
+        non_zero_mask = (s != 0)
+        if non_zero_mask.any():
+            non_zero = s[non_zero_mask]
+            log_vals = np.log1p(non_zero)
+            # Scale to [0, 1] range
+            scaled = (log_vals - self.log_min) / (self.log_max - self.log_min)
+            result[non_zero_mask] = scaled
+
+        # Use -1 for zeros, positive values for non-zeros
+        result = result * 2 - 1  # Scale to [-1, 1]
+        result[s == 0] = -1  # Set zeros to -1
+
+        return result
+
+    def inverse(self, v: np.ndarray) -> pd.Series:
+        # Initialize result with zeros
+        result = np.zeros_like(v, dtype=float)
+
+        # Apply threshold to determine which values should be non-zero
+        # Higher values in the output are more likely to be non-zero
+        non_zero_probs = (v + 1) / 2  # Convert from [-1, 1] to [0, 1]
+
+        # Use a probability threshold based on real data's zero rate
+        non_zero_mask = non_zero_probs > self.zero_rate
+
+        # Convert non-zero values back to original scale
+        if non_zero_mask.any():
+            # Rescale [0, 1] to log space
+            log_vals = non_zero_probs[non_zero_mask] * (self.log_max - self.log_min) + self.log_min
+            # Convert from log space
+            result[non_zero_mask] = np.expm1(log_vals)
+
+        return pd.Series(result)
+
+
+class _BoundedTf(_BaseTf):
+    """For variables with natural bounds like ages"""
+
+    def fit(self, s: pd.Series):
+        # Auto-detect boundaries
+        # For integer columns, round to nearest 5 or 10
+        if s.dtype in (int, np.int64, np.int32):
+            min_val = max(0, int(np.floor(s.min() / 5) * 5))
+            max_val = int(np.ceil(s.max() / 5) * 5)
+        else:
+            # For float columns, just use actual min/max
+            min_val = float(s.min())
+            max_val = float(s.max())
+
+        self.min_val = min_val
+        self.max_val = max_val
+
+        # Detect modality (unimodal, bimodal, etc)
+        self.mean = float(s.mean())
+        self.std = float(s.std())
+
+        # Save quantiles for better distribution matching
+        self.quantiles = np.quantile(s, np.linspace(0.05, 0.95, 19))
+        return self
+
+    def transform(self, s: pd.Series) -> np.ndarray:
+        # Clip values to bounds
+        s_clipped = s.clip(self.min_val, self.max_val)
+
+        # Scale to [-1, 1]
+        normalized = (s_clipped - self.min_val) / (self.max_val - self.min_val)
+        return 2 * normalized - 1
+
+    def inverse(self, v: np.ndarray) -> pd.Series:
+        # Convert back from [-1, 1] to [0, 1]
+        norm = (v + 1) / 2
+
+        # Apply distribution shape correction (optional)
+        # Map uniform quantiles to empirical distribution
+        if hasattr(self, 'quantiles'):
+            quantile_indices = np.floor(norm * 20).clip(0, 19).astype(int)
+            lower_q = np.zeros_like(norm)
+            upper_q = np.ones_like(norm) * self.max_val
+
+            # Apply quantile mapping for values that fall within our saved quantiles
+            mask = (quantile_indices > 0) & (quantile_indices < 19)
+            if mask.any():
+                lower_q[mask] = self.quantiles[quantile_indices[mask] - 1]
+                upper_q[mask] = self.quantiles[quantile_indices[mask]]
+
+                # Interpolate between quantiles
+                alpha = (norm[mask] * 20) % 1
+                norm[mask] = lower_q[mask] + alpha * (upper_q[mask] - lower_q[mask])
+
+        # Scale back to original range
+        raw = norm * (self.max_val - self.min_val) + self.min_val
+        return pd.Series(raw)
 
 class _ContTf(_BaseTf):
     """Rank‑gauss with light tail‑clipping for stability."""
@@ -212,6 +365,18 @@ class WGAN:
 
         self.W_smooth = None  # running abs Wasserstein
         self.n_critic = 5  # start conservatively
+        
+        # Initialize training metrics
+        self.metrics = {
+            'epochs': [],
+            'w_distance': [],
+            'd_loss': [],
+            'g_loss': [],
+            'n_critic': [],
+            'lr_d': [],
+            'lr_g': [],
+            'val_wd': {},  # To store validation Wasserstein distances per feature
+        }
 
         # ------------ column groups & transformers --------------
         self.num_cols, self.dt_cols, self.cat_cols, self.str_cols = [], [], [], []
@@ -233,10 +398,17 @@ class WGAN:
                 tf = _StdTf().fit(real[c])
             elif mode == "minmax":
                 tf = _MinMaxTf().fit(real[c])
+            elif mode == "log":
+                tf = _LogTf().fit(real[c])
+            elif mode == "zero_inflated":
+                tf = _ZeroInflatedTf().fit(real[c])
+            elif mode == "bounded":
+                tf = _BoundedTf().fit(real[c])
             else:  # default rank‑Gauss
                 tf = _ContTf().fit(real[c])
             self.tfs[c] = tf
             mats.append(tf.transform(real[c]))
+
         for c in self.dt_cols:
             tf = _DtTf(meta[c].datetime_format).fit(real[c]); self.tfs[c] = tf; mats.append(tf.transform(real[c]))
 
@@ -282,14 +454,14 @@ class WGAN:
         self.n_critic = cfg.n_critic_initial
 
     # ------------------------------------------------------------------#
-    def fit(self):
+    def fit(self, verbose=True):
         # ── 0) split the full real→tensor dataset into train/val ───────────────
         #    we already built self.loader.dataset.tensors[0] as X_all
         X_all = self.loader.dataset.tensors[0]  # torch.Tensor [N, features]
         N = X_all.size(0)
         idx = np.arange(N)
         train_idx, val_idx = train_test_split(idx, test_size=0.2, random_state=self.cfg.seed)
-
+    
         # rebuild a loader that only yields the TRAIN split
         X_train = X_all[train_idx]
         self.loader = DataLoader(
@@ -298,57 +470,85 @@ class WGAN:
             shuffle=True,
             drop_last=True
         )
-
+    
         # keep a pandas hold‑out for validation WD
         self.val_df = self.real_df.iloc[val_idx]
-
+    
         # reset any early‑stop counters if you like
         self.best_w = -float("inf")
         self.no_imp = 0
         self.w_ema = None
-
+    
+        # Reset metrics
+        self.metrics = {
+            'epochs': [],
+            'w_distance': [],
+            'd_loss': [],
+            'g_loss': [],
+            'n_critic': [],
+            'lr_d': [],
+            'lr_g': [],
+            'val_wd': {c: [] for c in self.num_cols + self.dt_cols},
+        }
+    
         # ── 1) the usual WGAN training loop ────────────────────────────────────
         for epoch in range(1, self.cfg.max_epochs + 1):
             d_sum = g_sum = w_sum = 0.0
-
+    
             for i, (real_batch,) in enumerate(self.loader, 1):
                 real_batch = real_batch.to(DEVICE)
                 cond = self._sample_cond(real_batch.size(0)).to(DEVICE)
-
+    
                 # train D
                 w_est, d_loss = self._train_d(real_batch, cond)
                 w_sum += w_est
                 d_sum += d_loss
-
+    
                 # train G every n_critic steps
                 if i % self.n_critic == 0:
                     g_loss = self._train_g(real_batch.size(0), cond)
                     g_sum += g_loss.item()
-
+    
             # adapt n_critic, decay LRs, EMA‑stop as before…
             mean_W = w_sum / len(self.loader)
             self._adjust_n_critic(mean_W)
             self.sch_g.step()
             self.sch_d.step()
-
+    
             d_mean = d_sum / len(self.loader)
             g_mean = g_sum / max(1, len(self.loader) / self.n_critic)
             lr_d = self.opt_d.param_groups[0]["lr"]
             lr_g = self.opt_g.param_groups[0]["lr"]
-
-            LOGGER.info(
-                "Ep %03d | W %.4f | D %.4f | G %.4f | n_c %d | lr_d %.6f | lr_g %.6f",
-                epoch, mean_W, d_mean, g_mean, self.n_critic, lr_d, lr_g
-            )
-
+    
+            # Store metrics
+            self.metrics['epochs'].append(epoch)
+            self.metrics['w_distance'].append(mean_W)
+            self.metrics['d_loss'].append(d_mean)
+            self.metrics['g_loss'].append(g_mean)
+            self.metrics['n_critic'].append(self.n_critic)
+            self.metrics['lr_d'].append(lr_d)
+            self.metrics['lr_g'].append(lr_g)
+    
+            if verbose:
+                LOGGER.info(
+                    "Ep %03d | W %.4f | D %.4f | G %.4f | n_c %d | lr_d %.6f | lr_g %.6f",
+                    epoch, mean_W, d_mean, g_mean, self.n_critic, lr_d, lr_g
+                )
+    
             if hasattr(self, "val_df") and epoch % self.cfg.val_interval == 0:
                 syn = self.generate(len(self.val_df))
+                val_wd_epoch = {}
+                
                 # numeric features
                 for c in self.num_cols:
                     real_vals = self.val_df[c].astype(float).values
                     syn_vals = syn[c].astype(float).values
                     wd = wasserstein_distance(real_vals, syn_vals)
-                    LOGGER.info(f"VAL WD (num) {c:30s}: {wd:.4f}")
+                    val_wd_epoch[c] = wd
+                    self.metrics['val_wd'][c].append((epoch, wd))
+                    if verbose:
+                        LOGGER.info(f"VAL WD (num) {c:30s}: {wd:.4f}")
+                
                 # datetime features → epoch seconds
                 for c in self.dt_cols:
                     real_ts = (
@@ -360,8 +560,16 @@ class WGAN:
                             .astype("int64") // 10 ** 9
                     ).values.astype(float)
                     wd = wasserstein_distance(real_ts, syn_ts)
-                    LOGGER.info(f"VAL WD (dt)  {c:30s}: {wd:.4f}")
-
+                    val_wd_epoch[c] = wd
+                    self.metrics['val_wd'][c].append((epoch, wd))
+                    if verbose:
+                        LOGGER.info(f"VAL WD (dt)  {c:30s}: {wd:.4f}")
+                
+                # Plot progress if configured
+                if epoch % self.cfg.plot_interval == 0:
+                    self.plot_training_metrics()
+                    self.plot_distributions(syn, cols=min(3, len(self.num_cols)))
+    
             # ── 3) early‐stop on W‐EMA if you like ────────────────────────────────
             w_est = -d_mean
             self.w_ema = w_est if self.w_ema is None else 0.9 * self.w_ema + 0.1 * w_est
@@ -370,22 +578,51 @@ class WGAN:
                 self.best_state = copy.deepcopy(self.G.state_dict())
             else:
                 self.no_imp += 1
-
+    
             if self.no_imp >= self.cfg.patience:
-                LOGGER.info("Early stop after %d epochs without improvement", self.cfg.patience)
+                if verbose:
+                    LOGGER.info("Early stop after %d epochs without improvement", self.cfg.patience)
                 break
+                
+        # Final visualization after training
+        self.plot_training_metrics()
+        
+        return self.metrics
 
     # ------------------------------------------------------------------#
-    def generate(self, n: int) -> pd.DataFrame:
+    def generate(self, n: int, use_best_model=False, temperature=1.0) -> pd.DataFrame:
+        """
+        Generate synthetic data.
+        
+        Parameters:
+            n: Number of samples to generate
+            use_best_model: Whether to use the best model saved during training
+            temperature: Temperature for sampling (higher = more diversity)
+        
+        Returns:
+            DataFrame with synthetic data
+        """
+        # Use best model if available and requested
+        if use_best_model and hasattr(self, 'best_state'):
+            orig_state = copy.deepcopy(self.G.state_dict())
+            self.G.load_state_dict(self.best_state)
+            self.ema_G = copy.deepcopy(self.G)
+        
         self.ema_G.eval()
         rows, bs = [], self.cfg.batch_size
         with torch.no_grad():
             for _ in range(0, n, bs):
                 cur = min(bs, n - len(rows))
-                z = torch.randn(cur, self.cfg.latent_dim, device=DEVICE)
+                # Apply temperature to noise distribution
+                z = torch.randn(cur, self.cfg.latent_dim, device=DEVICE) * temperature
                 cond = self._sample_cond(cur).to(DEVICE)
                 rows.append(self.ema_G(z, cond, hard=True).cpu().numpy())
         mat = np.vstack(rows)[:n]
+        
+        # Restore original model if we switched
+        if use_best_model and hasattr(self, 'best_state') and 'orig_state' in locals():
+            self.G.load_state_dict(orig_state)
+            self.ema_G = copy.deepcopy(self.G)
 
         ptr, data = 0, {}
         for c in self.num_cols:
@@ -494,7 +731,212 @@ class WGAN:
 
 
 
+    def plot_training_metrics(self, figsize=(15, 10)):
+        """
+        Plot training metrics including Wasserstein distance, losses, and other training parameters.
+        """
+        if not self.metrics['epochs']:
+            LOGGER.warning("No training metrics available to plot")
+            return
+            
+        plt.figure(figsize=figsize)
+        
+        # Create a 2x2 subplot layout
+        plt.subplot(2, 2, 1)
+        plt.plot(self.metrics['epochs'], self.metrics['w_distance'], 'b-', label='Wasserstein Distance')
+        plt.title('Wasserstein Distance')
+        plt.xlabel('Epoch')
+        plt.ylabel('W-Distance')
+        plt.grid(True, alpha=0.3)
+        plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
+        
+        plt.subplot(2, 2, 2)
+        plt.plot(self.metrics['epochs'], self.metrics['d_loss'], 'r-', label='Discriminator Loss')
+        plt.plot(self.metrics['epochs'], self.metrics['g_loss'], 'g-', label='Generator Loss')
+        plt.title('Training Losses')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
+        
+        plt.subplot(2, 2, 3)
+        plt.plot(self.metrics['epochs'], self.metrics['n_critic'], 'k-')
+        plt.title('n_critic Adaptation')
+        plt.xlabel('Epoch')
+        plt.ylabel('n_critic')
+        plt.grid(True, alpha=0.3)
+        plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
+        
+        plt.subplot(2, 2, 4)
+        plt.plot(self.metrics['epochs'], self.metrics['lr_d'], 'r-', label='D Learning Rate')
+        plt.plot(self.metrics['epochs'], self.metrics['lr_g'], 'g-', label='G Learning Rate')
+        plt.title('Learning Rates')
+        plt.xlabel('Epoch')
+        plt.ylabel('Learning Rate')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
+        
+        plt.tight_layout()
+        
+        # Save if configured
+        if self.cfg.save_plots:
+            plt.savefig(f'wgan_training_metrics_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png', dpi=300)
+            
+        plt.show()
+        
+        # Plot validation Wasserstein distances if available
+        val_features = [c for c in self.metrics['val_wd'] if self.metrics['val_wd'][c]]
+        if val_features:
+            # Determine number of rows needed (max 3 features per row)
+            n_features = len(val_features)
+            n_rows = (n_features + 2) // 3
+            
+            plt.figure(figsize=(15, 4 * n_rows))
+            
+            for i, feature in enumerate(val_features):
+                data = self.metrics['val_wd'][feature]
+                if not data:
+                    continue
+                    
+                epochs, wds = zip(*data)
+                
+                plt.subplot(n_rows, 3, i + 1)
+                plt.plot(epochs, wds, 'b-o')
+                plt.title(f'Validation WD: {feature}')
+                plt.xlabel('Epoch')
+                plt.ylabel('Wasserstein Distance')
+                plt.grid(True, alpha=0.3)
+                plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
+            
+            plt.tight_layout()
+            
+            if self.cfg.save_plots:
+                plt.savefig(f'wgan_validation_wd_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png', dpi=300)
+                
+            plt.show()
+    
+    def plot_distributions(self, synthetic_df=None, cols=None, samples=None, figsize=(15, 12)):
+        """
+        Plot distributions of real vs. generated data for numerical features.
+        
+        Parameters:
+            synthetic_df: DataFrame of synthetic data. If None, generates new data.
+            cols: Number of columns to plot. If None, plots all numerical columns.
+            samples: Number of samples to generate if synthetic_df is None.
+            figsize: Figure size tuple.
+        """
+        # If no synthetic data provided, generate some
+        if synthetic_df is None:
+            samples = samples or self.cfg.plot_samples
+            synthetic_df = self.generate(samples)
+        
+        # Determine which numerical columns to plot
+        num_features = self.num_cols
+        if not num_features:
+            LOGGER.warning("No numerical features available to plot")
+            return
+            
+        if cols is not None:
+            num_features = num_features[:cols]
+        
+        # Determine layout
+        n_features = len(num_features)
+        n_rows = (n_features + 2) // 3  # Up to 3 plots per row
+        
+        plt.figure(figsize=figsize)
+        
+        for i, col in enumerate(num_features):
+            plt.subplot(n_rows, 3, i + 1)
+            
+            # Plot real data distribution
+            real_vals = self.real_df[col].values
+            plt.hist(real_vals, bins=30, alpha=0.5, label='Real', density=True)
+            
+            # Plot synthetic data distribution
+            syn_vals = synthetic_df[col].values
+            plt.hist(syn_vals, bins=30, alpha=0.5, label='Synthetic', density=True)
+            
+            plt.title(f'Distribution: {col}')
+            plt.xlabel(col)
+            plt.ylabel('Density')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        if self.cfg.save_plots:
+            plt.savefig(f'wgan_distributions_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png', dpi=300)
+            
+        plt.show()
+        
+        # If there are enough numeric features, plot correlation matrix comparison
+        if len(num_features) >= 2:
+            self.plot_correlation_matrix(synthetic_df, features=num_features)
+    
+    def plot_correlation_matrix(self, synthetic_df=None, features=None, figsize=(15, 6)):
+        """
+        Plot correlation matrices for real and synthetic data side-by-side.
+        
+        Parameters:
+            synthetic_df: DataFrame of synthetic data. If None, generates new data.
+            features: List of features to include in correlation matrix.
+            figsize: Figure size tuple.
+        """
+        # If no synthetic data provided, generate some
+        if synthetic_df is None:
+            synthetic_df = self.generate(self.cfg.plot_samples)
+        
+        # If features not specified, use all numeric columns
+        if features is None:
+            features = self.num_cols
+            
+        if len(features) < 2:
+            LOGGER.warning("Need at least 2 features to plot correlation matrix")
+            return
+        
+        plt.figure(figsize=figsize)
+        
+        # Real data correlation matrix
+        plt.subplot(1, 2, 1)
+        real_corr = self.real_df[features].corr()
+        sns.heatmap(real_corr, annot=True, cmap='coolwarm', vmin=-1, vmax=1, fmt='.2f')
+        plt.title('Real Data Correlation Matrix')
+        
+        # Synthetic data correlation matrix
+        plt.subplot(1, 2, 2)
+        syn_corr = synthetic_df[features].corr()
+        sns.heatmap(syn_corr, annot=True, cmap='coolwarm', vmin=-1, vmax=1, fmt='.2f')
+        plt.title('Synthetic Data Correlation Matrix')
+        
+        plt.tight_layout()
+        
+        if self.cfg.save_plots:
+            plt.savefig(f'wgan_correlation_matrix_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png', dpi=300)
+            
+        plt.show()
+
+
 def _set_seed(s):
     random.seed(s); np.random.seed(s); torch.manual_seed(s)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(s)
+
+def visualize_wgan_training(wgan_model):
+    """
+    Visualize WGAN training metrics and generated data.
+    
+    Parameters:
+        wgan_model: Trained WGAN model
+    """
+    # Plot overall training metrics
+    wgan_model.plot_training_metrics()
+    
+    # Generate synthetic data and plot distributions
+    synthetic_data = wgan_model.generate(wgan_model.cfg.plot_samples)
+    wgan_model.plot_distributions(synthetic_data)
+    
+    # Plot correlation matrices
+    if len(wgan_model.num_cols) >= 2:
+        wgan_model.plot_correlation_matrix(synthetic_data)
