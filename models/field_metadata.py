@@ -25,9 +25,7 @@ class FieldMetadata:
             # datetime fields
             datetime_format: Optional[str] = None,
 
-            is_prediction_used: bool = False,
             transformer: Optional[str] = None,
-            match_moments: bool = False,
     ):
         self.data_type = data_type
         self.decimal_places = decimal_places
@@ -38,7 +36,3 @@ class FieldMetadata:
         self.faker_args = faker_args or {}
 
         self.datetime_format = datetime_format
-
-        self.is_prediction_used = is_prediction_used
-        self.transformer = transformer
-        self.match_moments = match_moments

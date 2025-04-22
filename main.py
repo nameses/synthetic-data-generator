@@ -3,14 +3,13 @@ import numpy as np
 from faker import Faker
 from typing import Dict, Optional
 import logging
-
 from data_generation.dataset_loader import DatasetLoader
 from data_generation.vae import VAEPipeline, VAEConfig
 from data_generation.wgan import WGAN
 
 from analytics.report_generator import generate_report
 from data_generation.wgan import GanConfig
-from models.enums import DataType, MethodType
+from models.enums import DataType
 from models.field_metadata import FieldMetadata
 from models.metadata import metadata_airline
 
@@ -34,30 +33,29 @@ def main():
         # load real data
         real_data = datasetLoader.load_real_data(
             data_path='datasets/airline-passenger-satisfaction.csv',
-            # data_path='datasets/healthcare_dataset.csv',
-            # data_path='datasets/adult.csv',
             metadata=metadata
-        )  # .head(40_000)
+        )
 
-        generator = WGAN(real=real_data, meta=metadata, cfg=GanConfig())
-        generator.fit(True)
+        # Configure WGAN with optimal parameters for airline dataset
+        gan_config = GanConfig(
+            max_epochs=600,
+            patience=400,
+            n_critic_initial=3,
+            gp_weight=2.5,
+            g_lr=1e-4,
+            d_lr=2e-4,
+        )
+
+        # Initialize and train WGAN
+        generator = WGAN(real=real_data, meta=metadata, cfg=gan_config)
+        # Train the model and get training metrics
+        generator.fit()
+        # Generate synthetic data using the best model
         synthetic_data = generator.generate(synthetic_size)
-
-        # vae = VAEPipeline(df=real_data, meta=metadata, cfg=VAEConfig())
-        # vae.train()
-        # synthetic_data = vae.generate(synthetic_size)
-
         logger.info(f"Generated synthetic data with shape: {synthetic_data.shape}")
 
-        # generate comparison
-        report_path = generate_report(real_data, synthetic_data, metadata)
-        logger.info(f"Generated comparison report at: {report_path}")
+        generate_report(real_data, synthetic_data, metadata)
 
-        # synthetic_data = pd.read_csv('reports/reports_20250418/report_20250418_040050/synthetic.csv')
-
-        # # generate comparison
-        # report_path = generate_report(real_data, synthetic_data, metadata)
-        # logger.info(f"Generated comparison report at: {report_path}")
 
     except Exception as e:
         logger.error(f"Error in data generation pipeline: {str(e)}", exc_info=True)

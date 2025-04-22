@@ -15,7 +15,7 @@ SYNTH_PATH = "synthetic.csv"
 
 NUM_FEATS = [
     "Age",
-    "Flight Distance",
+    #"Flight Distance",
     "Inflight wifi service",
     "Departure or Arrival time convenient",
     "Ease of Online booking",

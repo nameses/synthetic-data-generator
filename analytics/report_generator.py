@@ -100,17 +100,12 @@ def generate_report(real: pd.DataFrame, synth: pd.DataFrame, meta: Dict[str, Fie
 
             fig, axes = plt.subplots(1, 2, figsize=(16, 6))
 
-            bins = min(100, int(np.sqrt(len(r))))
-            axes[0].hist(r, bins=bins, density=True, alpha=0.8, label="Real", color="tab:blue")
-            axes[0].hist(s, bins=bins, density=True, alpha=0.8, label="Synthetic", color="tab:orange")
+            bins = min(50, int(np.sqrt(len(r))))
+            axes[0].hist(r, bins=bins, density=True, alpha=0.5, label="Real", color="tab:blue")
+            axes[0].hist(s, bins=bins, density=True, alpha=0.5, label="Synthetic", color="tab:orange")
             axes[0].set_title("Distribution Comparison", fontsize=12)
             axes[0].legend()
             axes[0].set_ylabel("Density")
-
-            # sns.kdeplot(r, ax=axes[0], label="Real", lw=2)
-            # sns.kdeplot(s, ax=axes[0], label="Synthetic", lw=2)
-            # axes[0].legend()
-            # axes[0].set_title(f"KDE: {col}")
 
             probs = np.linspace(0.01, 0.99, 100)
             qr = np.quantile(r, probs)
@@ -122,21 +117,37 @@ def generate_report(real: pd.DataFrame, synth: pd.DataFrame, meta: Dict[str, Fie
             safe_plot(fig, f"{col}_numeric.png")
 
         elif col in cat_cols:
-            real_freq = r.value_counts(normalize=True)
-            synth_freq = s.value_counts(normalize=True)
+            # Handle categorical columns
+            real_freq = r.astype(str).value_counts(normalize=True)
+            synth_freq = s.astype(str).value_counts(normalize=True)
+            
+            # Get unique categories from both datasets
             idx = sorted(set(real_freq.index).union(synth_freq.index))
-            real_vals = real_freq.reindex(idx, fill_value=0)
-            synth_vals = synth_freq.reindex(idx, fill_value=0)
+            
+            # Reindex with fill_value and ensure non-zero values for chi-square test
+            epsilon = 1e-10  # Small value to avoid division by zero
+            real_vals = real_freq.reindex(idx, fill_value=epsilon)
+            synth_vals = synth_freq.reindex(idx, fill_value=epsilon)
+            
+            # Calculate MAE
             mae = np.abs(real_vals - synth_vals).mean()
 
-            real_counts = (real_vals * 10000).round().astype(int)
-            synth_counts = (synth_vals * 10000).round().astype(int)
+            # Prepare counts for chi-square test (using larger multiplier to avoid small numbers)
+            scale_factor = 100000
+            real_counts = (real_vals * scale_factor).round().astype(int)
+            synth_counts = (synth_vals * scale_factor).round().astype(int)
+            
+            # Ensure no zero values in expected frequencies
+            real_counts = np.maximum(real_counts, 1)
+            
             try:
                 chi2, chi_p = chisquare(f_obs=synth_counts, f_exp=real_counts)
                 summary_lines.append(f"{col:30}| Cat-MAE {mae:.3f}| χ²={chi2:.2f}, p={chi_p:.4f}")
             except Exception as e:
-                summary_lines.append(f"{col:30}| Cat-MAE {mae:.3f}| χ² test failed: {str(e)}")
+                LOGGER.warning(f"Chi-square test failed for column {col}: {str(e)}")
+                summary_lines.append(f"{col:30}| Cat-MAE {mae:.3f}| χ² test failed")
 
+            # Plotting
             fig, ax = plt.subplots(figsize=(10, 4))
             width = 0.4
             x = np.arange(len(idx))
@@ -146,7 +157,7 @@ def generate_report(real: pd.DataFrame, synth: pd.DataFrame, meta: Dict[str, Fie
             ax.set_xticklabels(idx, rotation=30)
             ax.set_title(f"Frequencies: {col}")
             ax.legend()
-
+            
             safe_plot(fig, f"{col}_categorical.png")
 
         elif col in dt_cols:

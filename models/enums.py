@@ -8,9 +8,3 @@ class DataType(Enum):
     BOOLEAN = "boolean"
     CATEGORICAL = "categorical"
     DATETIME = "datetime"
-
-
-class MethodType(Enum):
-    GAN = "gan"
-    VAE = "vae"
-    WGAN = "wgan"
