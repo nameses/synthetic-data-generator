@@ -83,20 +83,48 @@ def generate_report(real: pd.DataFrame, synth: pd.DataFrame, meta: Dict[str, Fie
         r, s = real[col], synth[col]
 
         if col in num_cols:
-            w_dist = wasserstein_distance(r, s)
-
-            r_hist, bin_edges = np.histogram(r, bins=50, density=True)
-            s_hist, _ = np.histogram(s, bins=bin_edges, density=True)
-
-            # Add small epsilon to avoid log(0)
-            epsilon = 1e-8
-            r_hist = r_hist + epsilon
-            s_hist = s_hist + epsilon
-
-            kl_div = entropy(r_hist, s_hist)
-
-            ks_stat, _ = ks_2samp(r, s)
-            summary_lines.append(f"{col:30}| W-dist {w_dist:.3f} | KS {ks_stat:.3f} | KL {kl_div:.3f}")
+            # Handle numerical columns with care to avoid overflow
+            try:
+                # Convert values carefully to float64 for distance calculations
+                r_safe = r.values
+                s_safe = s.values
+                
+                # Convert integer types to float64 to handle larger values
+                if r_safe.dtype.kind in 'iu':  # Integer type
+                    r_safe = r_safe.astype(np.float64)
+                if s_safe.dtype.kind in 'iu':  # Integer type
+                    s_safe = s_safe.astype(np.float64)
+                    
+                # Replace non-finite values and clip to reasonable range
+                r_safe = np.nan_to_num(r_safe, nan=0.0)
+                s_safe = np.nan_to_num(s_safe, nan=0.0)
+                
+                # Use conservative bounds for statistical calculations
+                max_bound = 1e6
+                r_safe = np.clip(r_safe, -max_bound, max_bound)
+                s_safe = np.clip(s_safe, -max_bound, max_bound)
+                
+                # Calculate metrics with safe values
+                w_dist = wasserstein_distance(r_safe, s_safe)
+                
+                # Create histograms with the safe values
+                r_hist, bin_edges = np.histogram(r_safe, bins=50, density=True)
+                s_hist, _ = np.histogram(s_safe, bins=bin_edges, density=True)
+                
+                # Add small epsilon to avoid log(0)
+                epsilon = 1e-8
+                r_hist = r_hist + epsilon
+                s_hist = s_hist + epsilon
+                
+                kl_div = entropy(r_hist, s_hist)
+                
+                # KS test is more robust to large values
+                ks_stat, _ = ks_2samp(r_safe, s_safe)
+                
+                summary_lines.append(f"{col:30}| W-dist {w_dist:.3f} | KS {ks_stat:.3f} | KL {kl_div:.3f}")
+            except Exception as e:
+                LOGGER.warning(f"Error calculating metrics for {col}: {str(e)}")
+                summary_lines.append(f"{col:30}| Error calculating metrics: {str(e)}")
 
             fig, axes = plt.subplots(1, 2, figsize=(16, 6))
 

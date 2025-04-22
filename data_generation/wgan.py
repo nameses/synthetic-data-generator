@@ -70,6 +70,15 @@ class GanConfig:
     tau_start: float = 2.5
     tau_end: float = 0.25
     val_interval: int = 5
+    
+    # Advanced transformation options
+    use_conditional_gan: bool = True  # Enable conditional GAN for related columns
+    advanced_transformers: bool = True  # Enable advanced transformers
+    post_process_outliers: bool = True  # Clamp outliers in post-processing
+    enhanced_network_capacity: bool = False  # Use larger networks for complex distributions
+    generator_depth: int = 3  # Number of hidden layers in generator
+    discriminator_depth: int = 3  # Number of hidden layers in discriminator
+    additional_g_capacity: int = 256  # Additional capacity for enhanced networks
 
 
 # ------------------------------------------------------------------#
@@ -105,6 +114,162 @@ class _MinMaxTf(_BaseTf):
         r = (v + 1) / 2
         raw = r * (self.max_ - self.min_) + self.min_
         return pd.Series(raw)
+    
+    
+class LogTransformer:
+    """Log transformer to handle skewed data: log(1+x) with safe bounds handling"""
+
+    def __init__(self):
+        self.zeros_mask = None
+        # Store original data statistics for safe mapping back
+        self.orig_min = None
+        self.orig_max = None
+        self.orig_median = None
+        self.orig_mean = None
+        self.orig_percentiles = None
+        self.transformed_stats = None
+
+    def fit(self, s: pd.Series) -> 'LogTransformer':
+        # Store indices of zeros to preserve them if needed
+        if hasattr(s, 'metadata') and getattr(s.metadata, 'preserve_zeros', False):
+            self.zeros_mask = (s == 0)
+        
+        # Store original data statistics before transformation
+        valid_data = s.dropna().values
+        self.orig_min = float(valid_data.min())
+        self.orig_max = float(valid_data.max())
+        self.orig_median = float(np.median(valid_data))
+        self.orig_mean = float(np.mean(valid_data))
+        
+        # Store percentiles for better distribution matching
+        percentiles = [1, 5, 10, 25, 50, 75, 90, 95, 99]
+        self.orig_percentiles = {p: float(np.percentile(valid_data, p)) for p in percentiles}
+        
+        # Apply the transformation and store transformed statistics
+        transformed = np.log1p(valid_data)
+        self.transformed_stats = {
+            'min': float(transformed.min()),
+            'max': float(transformed.max()),
+            'median': float(np.median(transformed)),
+            'percentiles': {p: float(np.percentile(transformed, p)) for p in percentiles}
+        }
+        
+        return self
+
+    def transform(self, s: pd.Series) -> np.ndarray:
+        # Apply log(1+x) transform
+        transformed = np.log1p(s.values)
+        return transformed
+
+    def inverse(self, v: np.ndarray) -> pd.Series:
+        """
+        Safely inverse transform log-transformed values, ensuring:
+        1. Proper scaling to the original range
+        2. No overflow errors
+        3. Distribution shape is preserved
+        """
+        # First clip the incoming values to the transformed range to avoid extreme outliers
+        if self.transformed_stats:
+            # Add a small buffer to the transformed range
+            t_min = self.transformed_stats['min'] - 0.1
+            t_max = self.transformed_stats['max'] + 0.1
+            v = np.clip(v, t_min, t_max)
+        
+        # Apply the basic inverse transformation
+        raw = np.expm1(v)
+        
+        # Clip to safe integer bounds if very large values might be created
+        if self.orig_max > 1e6:
+            # If the original data had large values, be more conservative
+            int_max = float(2**31 - 1)  # int32 max
+            raw = np.clip(raw, 0, int_max / 2)
+        
+        # Restore exact zeros if needed
+        if self.zeros_mask is not None and len(self.zeros_mask) == len(raw):
+            raw[self.zeros_mask] = 0
+            
+        # Enforce the same range as the original data
+        if self.orig_min is not None and self.orig_max is not None:
+            raw = np.clip(raw, self.orig_min, self.orig_max)
+
+        return pd.Series(raw)
+
+
+class YeoJohnsonTransformer:
+    """Yeo-Johnson power transformer for handling skewed data without sign restrictions"""
+
+    def __init__(self):
+        self.lambda_ = None
+        self.zeros_mask = None
+
+    def fit(self, s: pd.Series) -> 'YeoJohnsonTransformer':
+        from scipy import stats
+        # If your SciPy ≥ 1.3 you can use yeojohnson_normmax directly:
+        if hasattr(stats, "yeojohnson_normmax"):
+            self.lambda_ = stats.yeojohnson_normmax(s.values)
+        else:
+            # Fallback: brute‑force search over a grid using yeojohnson_llf
+            lmbdas = np.linspace(-2, 2, 401)
+            llfs = [stats.yeojohnson_llf(l, s.values) for l in lmbdas]
+            self.lambda_ = float(lmbdas[np.argmax(llfs)])
+        return self
+
+    def transform(self, s: pd.Series) -> np.ndarray:
+        from scipy import stats
+        transformed = stats.yeojohnson(s.values, lmbda=self.lambda_)
+        return transformed
+
+    def inverse(self, v: np.ndarray) -> pd.Series:
+        """Inverse Yeo-Johnson transformation"""
+        result = np.zeros_like(v, dtype=float)
+
+        # Lambda cases for inverse transform
+        if self.lambda_ == 0:
+            result = np.expm1(v)
+        elif self.lambda_ < 0:
+            # x < 0 case
+            result = 1 - np.power(-(self.lambda_*v + 1), 1/self.lambda_)
+        elif self.lambda_ > 0 and self.lambda_ != 2:
+            # x ≥ 0 case
+            result = np.power((self.lambda_*v + 1), 1/self.lambda_) - 1
+        elif self.lambda_ == 2:
+            # Special case
+            result = np.expm1(v)
+
+        # Restore exact zeros if needed
+        if self.zeros_mask is not None and len(self.zeros_mask) == len(result):
+            result[self.zeros_mask] = 0
+
+        return pd.Series(result)
+
+
+class TransformerChain:
+    """Chain of transformers to be applied sequentially"""
+
+    def __init__(self, transformers):
+        self.transformers = transformers
+
+    def fit(self, s: pd.Series) -> 'TransformerChain':
+        # Fit each transformer in the chain
+        current = s.copy()
+        for transformer in self.transformers:
+            transformer.fit(current)
+            current = pd.Series(transformer.transform(current))
+        return self
+
+    def transform(self, s: pd.Series) -> np.ndarray:
+        # Apply each transformer in sequence
+        current = s
+        for transformer in self.transformers:
+            current = pd.Series(transformer.transform(current))
+        return current.values
+
+    def inverse(self, v: np.ndarray) -> pd.Series:
+        # Apply inverse transformations in reverse order
+        current = v
+        for transformer in reversed(self.transformers):
+            current = transformer.inverse(current)
+        return current
 
 
 class _ContTf(_BaseTf):
@@ -228,15 +393,28 @@ class WGAN:
         self.tfs: Dict[str, _BaseTf] = {}; mats = []
 
         for c in self.num_cols:
-            mode = getattr(self.meta[c], "transformer", None)
-            if mode == "standard":
-                tf = _StdTf().fit(real[c])
-            elif mode == "minmax":
-                tf = _MinMaxTf().fit(real[c])
-            else:  # default rank‑Gauss
+            m = self.meta[c]
+            if m.transformer:
+                # Build a chain of actual transformer instances
+                instances = []
+                for name in m.transformer:
+                    if name == "standard":
+                        instances.append(_StdTf())
+                    elif name == "minmax":
+                        instances.append(_MinMaxTf())
+                    elif name == "log":
+                        instances.append(LogTransformer())
+                    elif name == "yeo-johnson":
+                        instances.append(YeoJohnsonTransformer())
+                    else:
+                        raise ValueError(f"Unknown transformer {name}")
+                tf = TransformerChain(instances).fit(real[c])
+            else:
+                # Default to rank‑gauss
                 tf = _ContTf().fit(real[c])
             self.tfs[c] = tf
             mats.append(tf.transform(real[c]))
+
         for c in self.dt_cols:
             tf = _DtTf(meta[c].datetime_format).fit(real[c]); self.tfs[c] = tf; mats.append(tf.transform(real[c]))
 
@@ -345,22 +523,87 @@ class WGAN:
                 syn = self.generate(len(self.val_df))
                 # numeric features
                 for c in self.num_cols:
-                    real_vals = self.val_df[c].astype(float).values
-                    syn_vals = syn[c].astype(float).values
-                    wd = wasserstein_distance(real_vals, syn_vals)
-                    LOGGER.info(f"VAL WD (num) {c:30s}: {wd:.4f}")
+                    # Use a safer approach for Wasserstein distance calculation
+                    try:
+                        # Special handling for log-transformed columns which can have extreme ranges
+                        if hasattr(self.meta[c], 'transformer') and self.meta[c].transformer and 'log' in self.meta[c].transformer:
+                            # For log-transformed columns, calculate WD in log space to avoid overflow
+                            # This is more stable and still gives meaningful distance metrics
+                            
+                            # Convert both to float64 first (most important step)
+                            real_vals = self.val_df[c].values.astype(np.float64)
+                            syn_vals = syn[c].values.astype(np.float64)
+                            
+                            # Add a small epsilon to avoid log(0)
+                            epsilon = 1e-10
+                            real_vals = np.maximum(real_vals, epsilon)
+                            syn_vals = np.maximum(syn_vals, epsilon)
+                            
+                            # Transform to log space (similar to the original transform)
+                            real_log = np.log1p(real_vals)
+                            syn_log = np.log1p(syn_vals)
+                            
+                            # Calculate WD in log space
+                            wd = wasserstein_distance(real_log, syn_log)
+                            LOGGER.info(f"VAL WD (log) {c:30s}: {wd:.4f}")
+                            
+                        # Regular handling for non-log-transformed columns
+                        else:
+                            # Convert values to float64 but handle potential overflow
+                            # For integer columns, first convert to float64 which has a wider range
+                            if self.meta[c].data_type == DataType.INTEGER:
+                                # For real data
+                                real_vals = self.val_df[c].values
+                                if real_vals.dtype.kind in 'iu':  # If integer type
+                                    real_vals = real_vals.astype(np.float64)
+                                
+                                # For synthetic data
+                                syn_vals = syn[c].values
+                                if syn_vals.dtype.kind in 'iu':  # If integer type
+                                    syn_vals = syn_vals.astype(np.float64)
+                            else:
+                                # For DECIMAL type, already float
+                                real_vals = self.val_df[c].values
+                                syn_vals = syn[c].values
+                                
+                            # Replace any non-finite values with finite ones
+                            real_vals = np.nan_to_num(real_vals, nan=0.0)
+                            syn_vals = np.nan_to_num(syn_vals, nan=0.0)
+                            
+                            # Clip to reasonable range to avoid extreme values
+                            # Use more conservative bounds for numeric calculations
+                            max_bound = 1e6
+                            real_vals = np.clip(real_vals, -max_bound, max_bound)
+                            syn_vals = np.clip(syn_vals, -max_bound, max_bound)
+                        
+                            # Calculate WD with safe values
+                            wd = wasserstein_distance(real_vals, syn_vals)
+                            LOGGER.info(f"VAL WD (num) {c:30s}: {wd:.4f}")
+                    except Exception as e:
+                        LOGGER.warning(f"Could not calculate WD for {c}: {e}")
+                        # Print more debug info
+                        LOGGER.warning(f"Real dtype: {self.val_df[c].dtype}, Syn dtype: {syn[c].dtype}")
+                        LOGGER.warning(f"Real range: [{self.val_df[c].min()} to {self.val_df[c].max()}], " 
+                                      f"Syn range: [{syn[c].min()} to {syn[c].max()}]")
+                
                 # datetime features → epoch seconds
                 for c in self.dt_cols:
-                    real_ts = (
-                            pd.to_datetime(self.val_df[c], format=self.meta[c].datetime_format)
-                            .astype("int64") // 10 ** 9
-                    ).values.astype(float)
-                    syn_ts = (
-                            pd.to_datetime(syn[c], format=self.meta[c].datetime_format)
-                            .astype("int64") // 10 ** 9
-                    ).values.astype(float)
-                    wd = wasserstein_distance(real_ts, syn_ts)
-                    LOGGER.info(f"VAL WD (dt)  {c:30s}: {wd:.4f}")
+                    try:
+                        real_ts = (
+                                pd.to_datetime(self.val_df[c], format=self.meta[c].datetime_format, errors='coerce')
+                                .astype("int64") // 10 ** 9
+                        ).values.astype(np.float64)
+                        syn_ts = (
+                                pd.to_datetime(syn[c], format=self.meta[c].datetime_format, errors='coerce')
+                                .astype("int64") // 10 ** 9
+                        ).values.astype(np.float64)
+                        # Ensure finite values
+                        real_ts = np.nan_to_num(real_ts, nan=0)
+                        syn_ts = np.nan_to_num(syn_ts, nan=0)
+                        wd = wasserstein_distance(real_ts, syn_ts)
+                        LOGGER.info(f"VAL WD (dt)  {c:30s}: {wd:.4f}")
+                    except Exception as e:
+                        LOGGER.warning(f"Could not calculate WD for datetime {c}: {e}")
 
             # ── 3) early‐stop on W‐EMA if you like ────────────────────────────────
             w_est = -d_mean
@@ -388,18 +631,163 @@ class WGAN:
         mat = np.vstack(rows)[:n]
 
         ptr, data = 0, {}
+        
+        # Get original data ranges for all numeric columns for safer bounds enforcement
+        orig_ranges = {}
+        for c in self.num_cols:
+            if c in self.real_df.columns:
+                orig_ranges[c] = {
+                    'min': float(self.real_df[c].min()),
+                    'max': float(self.real_df[c].max()),
+                    'median': float(self.real_df[c].median()),
+                    'mean': float(self.real_df[c].mean())
+                }
+        
         for c in self.num_cols:
             inv = self.tfs[c].inverse(mat[:, ptr])
             ptr += 1
-
-            # 1) invert any upstream log-transform
-            if getattr(self.meta[c], 'transformer', None) == 'log':
-                inv = np.expm1(inv)
-
-            # 2) round to integer or fixed decimals
+    
+            # Apply any needed post-processing
             m = self.meta[c]
+    
+            # Handle NaN and inf values first - use more conservative bounds
+            safe_max = min(1e9, np.finfo(np.float64).max / 1e6)
+            safe_min = max(-1e9, np.finfo(np.float64).min / 1e6)
+            inv = np.nan_to_num(inv, nan=0, posinf=safe_max, neginf=safe_min)
+
+            # 1) Restore zeros if needed (important for delay columns)
+            if hasattr(m, 'preserve_zeros') and m.preserve_zeros:
+                # Generate random mask for zeros (probability based on real data)
+                real_zeros_pct = (self.real_df[c] == 0).mean()
+                if real_zeros_pct > 0.01:  # Only if zeros are meaningfully present
+                    zero_mask = np.random.random(len(inv)) < real_zeros_pct
+                    inv[zero_mask] = 0
+
+            # 2) Handle log-transformed data with our improved transformer
+            if hasattr(m, 'transformer') and m.transformer and 'log' in m.transformer:
+                # The LogTransformer has already been applied by now, but we need 
+                # to ensure the values are in the appropriate range and distribution
+                
+                # Get original data range
+                orig_min = float(self.real_df[c].min())
+                orig_max = float(self.real_df[c].max())
+                
+                # Get the current range of generated values
+                curr_min, curr_max = float(inv.min()), float(inv.max())
+                
+                # First ensure we don't have infinite or NaN values
+                inv = np.nan_to_num(inv, nan=0, posinf=orig_max, neginf=orig_min)
+                
+                # Find columns with extreme ranges that might cause overflow
+                if orig_max > 1e6 or curr_max > 1e6:
+                    # For columns with very large values, use distribution matching
+                    # instead of exact value matching to avoid overflow
+                    
+                    # Get percentiles from real data
+                    real_percentiles = [1, 5, 10, 25, 50, 75, 90, 95, 99]
+                    real_values = np.percentile(self.real_df[c].values, real_percentiles)
+                    
+                    # Get same percentiles from synthetic data
+                    syn_values = np.percentile(inv, real_percentiles)
+                    
+                    # For each synthetic value, find where it falls in the synthetic percentiles
+                    # and map to the corresponding real percentile
+                    result = np.zeros_like(inv)
+                    
+                    # For each value, find the closest percentile bin and scale within that bin
+                    for i, val in enumerate(inv):
+                        # Find which percentile bin this value falls into
+                        if val <= syn_values[0]:
+                            # Below the 1st percentile
+                            result[i] = real_values[0] * (val / max(syn_values[0], 1e-10))
+                        elif val >= syn_values[-1]:
+                            # Above the 99th percentile
+                            ratio = min((val - syn_values[-1]) / max((curr_max - syn_values[-1]), 1e-10), 10.0)
+                            result[i] = real_values[-1] + ratio * (orig_max - real_values[-1])
+                        else:
+                            # Find which bin the value is in
+                            for j in range(len(real_percentiles)-1):
+                                if syn_values[j] <= val <= syn_values[j+1]:
+                                    # Linear interpolation within this bin
+                                    bin_ratio = (val - syn_values[j]) / max((syn_values[j+1] - syn_values[j]), 1e-10)
+                                    result[i] = real_values[j] + bin_ratio * (real_values[j+1] - real_values[j])
+                                    break
+                    
+                    # Use the mapped values but ensure we respect bounds
+                    inv = np.clip(result, orig_min, orig_max)
+                else:
+                    # For columns with moderate values, a simpler approach is sufficient
+                    # Simple range scaling from current range to original range
+                    scaling_factor = (orig_max - orig_min) / max((curr_max - curr_min), 1e-10)
+                    inv = orig_min + (inv - curr_min) * scaling_factor
+                    inv = np.clip(inv, orig_min, orig_max)
+
+            # 3) Handle outliers with clamping if enabled
+            if self.cfg.post_process_outliers:
+                if hasattr(m, 'clamp_min') and m.clamp_min is not None:
+                    if 0 < m.clamp_min < 1:  # Treat as percentile
+                        min_val = np.percentile(self.real_df[c], m.clamp_min * 100)
+                    else:  # Treat as absolute value
+                        min_val = m.clamp_min
+                    inv = np.maximum(inv, min_val)
+
+                if hasattr(m, 'clamp_max') and m.clamp_max is not None:
+                    if 0 < m.clamp_max < 1:  # Treat as percentile
+                        max_val = np.percentile(self.real_df[c], m.clamp_max * 100)
+                    else:  # Treat as absolute value
+                        max_val = m.clamp_max
+                    inv = np.minimum(inv, max_val)
+
+            # 4) Make sure conditionally dependent columns respect their dependencies
+            if hasattr(m, 'conditional_on') and m.conditional_on and self.cfg.use_conditional_gan:
+                parent_col = m.conditional_on
+                if parent_col in data:  # If parent already processed
+                    # Apply relationship-specific adjustments
+                    if c == 'Arrival Delay in Minutes' and parent_col == 'Departure Delay in Minutes':
+                        # Arrival delays are typically slightly larger than departure delays
+                        # Allow some flights to arrive early relative to their departure delay
+                        early_mask = np.random.random(len(inv)) < 0.2  # 20% chance of early arrival
+                        delay_factor = np.random.uniform(0.8, 1.2, len(inv))  # Realistic variation
+                        inv = np.where(early_mask,
+                                      np.maximum(0, data[parent_col] - np.random.uniform(5, 20, len(inv))),
+                                      data[parent_col] * delay_factor)
+
+            # 5) round to integer or fixed decimals with safe casting
             if m.data_type is DataType.INTEGER:
-                inv = np.round(inv).astype(int)
+                # For columns that had log transform, be especially careful
+                if hasattr(m, 'transformer') and m.transformer and 'log' in m.transformer:
+                    # Get the range of the original integer column
+                    col_min = max(0, self.real_df[c].min())  # Ensure non-negative for log-transformed columns
+                    col_max = min(np.iinfo(np.int32).max / 2, self.real_df[c].max())  # Safer upper bound
+                    
+                    # Clip to the actual range seen in the data, not the maximum possible range
+                    inv = np.clip(inv, col_min, col_max)
+                    inv = np.round(inv)
+                    
+                    # Try to safely convert to int32
+                    try:
+                        inv = inv.astype(np.int32)
+                    except (OverflowError, ValueError):
+                        # If still having issues, use an even more conservative approach
+                        LOGGER.warning(f"Issues with {c} - using conservative approach")
+                        # First convert to float64 which has much larger range
+                        inv_float = inv.astype(np.float64)
+                        # Then round and clip to int32 range
+                        inv_float = np.round(inv_float)
+                        inv_float = np.clip(inv_float, np.iinfo(np.int32).min, np.iinfo(np.int32).max)
+                        # Finally convert to int32
+                        inv = inv_float.astype(np.int32)
+                else:
+                    # Standard integer handling for non-log-transformed columns
+                    INT_MIN, INT_MAX = np.iinfo(np.int32).min, np.iinfo(np.int32).max
+                    inv = np.clip(inv, INT_MIN, INT_MAX)
+                    inv = np.round(inv)
+                    
+                    try:
+                        inv = inv.astype(np.int32)
+                    except (OverflowError, ValueError):
+                        LOGGER.warning(f"Integer overflow in column {c} - forcing clipping to int32 range")
+                        inv = np.clip(inv, INT_MIN, INT_MAX).astype(np.int32)
             else:  # DECIMAL
                 inv = np.round(inv, m.decimal_places)
 

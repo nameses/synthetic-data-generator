@@ -6,10 +6,14 @@ from models.field_metadata import FieldMetadata
 metadata_airline = {
     'Gender': FieldMetadata(DataType.CATEGORICAL, sampling='empirical'),
     'Customer Type': FieldMetadata(DataType.CATEGORICAL, sampling='empirical'),
-    'Age': FieldMetadata(DataType.INTEGER, sampling='empirical', transformer = 'standard'),
+    'Age': FieldMetadata(DataType.INTEGER, sampling='empirical', 
+                         transformer=['yeo-johnson', 'minmax'],  # Better handling of age distribution
+                         clamp_min=0.01),
     'Type of Travel': FieldMetadata(DataType.CATEGORICAL, sampling='empirical'),
     'Class': FieldMetadata(DataType.CATEGORICAL, sampling='empirical'),
-    'Flight Distance': FieldMetadata(DataType.INTEGER, sampling='empirical', transformer = 'minmax'),
+    'Flight Distance': FieldMetadata(DataType.INTEGER, sampling='empirical', 
+                                    transformer=['log', 'minmax'],  # Log transform for skewed distribution
+                                    clamp_min=0.01),  # Prevent negative distances
     'Inflight wifi service': FieldMetadata(DataType.INTEGER),
     'Departure or Arrival time convenient': FieldMetadata(DataType.INTEGER),
     'Ease of Online booking': FieldMetadata(DataType.INTEGER),
@@ -24,8 +28,15 @@ metadata_airline = {
     'Checkin service': FieldMetadata(DataType.INTEGER),
     'Inflight service': FieldMetadata(DataType.INTEGER),
     'Cleanliness': FieldMetadata(DataType.INTEGER),
-    'Departure Delay in Minutes': FieldMetadata(DataType.INTEGER, sampling='empirical', transformer = 'minmax'),
-    'Arrival Delay in Minutes': FieldMetadata(DataType.DECIMAL, decimal_places=1, sampling='empirical', transformer = 'minmax'),
+    'Departure Delay in Minutes': FieldMetadata(DataType.INTEGER, sampling='empirical', 
+                                               transformer=['log', 'minmax'],  # Better for skewed delay distribution
+                                               preserve_zeros=True,  # Many flights have zero delay
+                                               clamp_min=0),  # Delays can't be negative
+    'Arrival Delay in Minutes': FieldMetadata(DataType.DECIMAL, decimal_places=1, sampling='empirical', 
+                                             transformer=['log', 'minmax'],
+                                             conditional_on='Departure Delay in Minutes',  # Arrival depends on departure
+                                             preserve_zeros=True,
+                                             clamp_min=0),
     'satisfaction': FieldMetadata(DataType.CATEGORICAL, sampling='empirical'),
 }
 

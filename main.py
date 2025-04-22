@@ -38,12 +38,22 @@ def main():
 
         # Configure WGAN with optimal parameters for airline dataset
         gan_config = GanConfig(
-            max_epochs=600,
-            patience=400,
-            n_critic_initial=3,
+            max_epochs=500,
+            patience=14,
+            n_critic_initial=4,
             gp_weight=2.5,
+            drift_epsilon=1e-3,
             g_lr=1e-4,
             d_lr=2e-4,
+            lr_min_ratio=0.05,
+            # Enable advanced features for better numeric column generation
+            use_conditional_gan=True,
+            advanced_transformers=True,
+            post_process_outliers=True,
+            enhanced_network_capacity=True,
+            generator_depth=4,
+            discriminator_depth=3,
+            additional_g_capacity=384
         )
 
         # Initialize and train WGAN

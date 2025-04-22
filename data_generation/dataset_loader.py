@@ -69,7 +69,7 @@ class DatasetLoader:
                 m.min_value = float(df[col].min())
                 m.max_value = float(df[col].max())
                 # optionally apply user-specified log_transform
-                if getattr(m, 'transformer', None) == 'log':
+                if m.transformer and 'log' in m.transformer:
                     df[col] = np.log1p(df[col])
 
         if sample_size is not None and len(df) > sample_size:
