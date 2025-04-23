@@ -4,6 +4,8 @@ from models.enums import DataType
 from models.field_metadata import FieldMetadata
 
 metadata_airline = {
+    'City': FieldMetadata(DataType.STRING, faker_method=Faker().city),
+    'Date': FieldMetadata(DataType.DATETIME, datetime_format='%Y-%m-%d', sampling='empirical'),
     'Gender': FieldMetadata(DataType.CATEGORICAL, sampling='empirical'),
     'Customer Type': FieldMetadata(DataType.CATEGORICAL, sampling='empirical'),
     'Age': FieldMetadata(DataType.INTEGER, sampling='empirical', transformer = 'bounded'),

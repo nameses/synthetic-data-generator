@@ -1,4 +1,5 @@
 # vae_pipeline.py
+import copy
 import logging
 import os
 from datetime import datetime
@@ -15,6 +16,7 @@ from typing import Dict, List
 
 from models.enums import DataType
 from models.field_metadata import FieldMetadata
+from data_generation.transformers import _LogTf, _ZeroInflatedTf, _BoundedTf, _MinMaxTf
 
 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 fh = logging.FileHandler(f"train_{ts}.log", mode="w", encoding="utf‑8")
@@ -22,6 +24,14 @@ fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 
 LOGGER = logging.getLogger(__name__)
 LOGGER.addHandler(fh)
+
+_TF_REGISTRY = {
+    None: _MinMaxTf(),
+    "log": _LogTf(),
+    "zero_inflated": _ZeroInflatedTf(),
+    "bounded": _BoundedTf(),
+    "minmax": _MinMaxTf()
+}
 
 class VAEConfig:
     """
@@ -31,26 +41,28 @@ class VAEConfig:
     def __init__(
         self,
         latent_dim: int = 512,
-        hidden_dims: List[int] = [256, 512, 1024, 1024, 512, 256],
+        hidden_dims: List[int] = None,
         batch_size: int = 512,
         lr: float = 1e-3,
         weight_decay: float = 1e-5,
         epochs: int = 300,
-        beta_kl: float = 1.0,
-        lambda_corr: float = 0.75,
+        beta_kl: float = 0.7,
+        lambda_corr: float = 1.2,
         lambda_mmd: float = 5.0,
         scheduler_type: str = 'cosine',  # 'cosine' or 'plateau'
         device: str = None
     ):
+        if hidden_dims is None:
+            hidden_dims = [256, 512, 1024, 1024, 512, 256]
         self.latent_dim = latent_dim
         self.hidden_dims = hidden_dims
         self.batch_size = batch_size
         self.lr = lr
         self.weight_decay = weight_decay
         self.epochs = epochs
-        self.beta_kl = beta_kl        # KL weight
-        self.lambda_corr = lambda_corr # correlation matching penalty
-        self.lambda_mmd = lambda_mmd   # MMD marginal matching weight
+        self.beta_kl = beta_kl
+        self.lambda_corr = lambda_corr
+        self.lambda_mmd = lambda_mmd
         self.scheduler_type = scheduler_type
         self.device = torch.device(device) if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.faker = Faker()
@@ -97,17 +109,44 @@ class VAEPipeline:
         self.str_cols = [c for c,m in meta.items() if m.data_type == DataType.STRING]
         self._preprocess()
         # Precompute original numeric correlation matrix
+        corr_parts = []
+        for c in self.num_cols:
+            tf = self.transformers[c]
+            arr = tf.transform(self.df[c])
+            corr_parts.append(arr)
+
+        for c in self.cat_cols:
+            vals = self.df[c].astype("category").cat.codes.values
+            corr_parts.append(2 * (vals / vals.max()) - 1)
+
         self.orig_corr = torch.tensor(
-            np.corrcoef(
-                np.hstack([self.scalers[c].transform(self.df[[c]]) for c in self.num_cols]).T
-            ), dtype=torch.float32, device=self.cfg.device
-        )
+            np.corrcoef(np.column_stack(corr_parts).T),
+            dtype=torch.float32, device=self.cfg.device)
+
         self.model = VAEModel(self.X.shape[1], cfg).to(cfg.device)
 
     def _preprocess(self):
-        self.scalers = {c: MinMaxScaler((-1,1)).fit(self.df[[c]]) for c in self.num_cols}
-        num_arr = [self.scalers[c].transform(self.df[[c]]) for c in self.num_cols]
-        X_num = np.hstack(num_arr) if num_arr else np.zeros((len(self.df),0))
+        from sklearn.preprocessing import MinMaxScaler
+        self.transformers = {}
+        num_arr = []
+        for c in self.num_cols:
+            tf_name = getattr(self.meta[c], "transformer", None)
+            tf = copy.deepcopy(_TF_REGISTRY[tf_name])
+
+            # sklearn.MinMaxScaler wants a 2D array; our custom transformers want a Series
+            if isinstance(tf, MinMaxScaler):
+                # fit & transform with a one-column DataFrame
+                tf.fit(self.df[[c]])
+                arr = tf.transform(self.df[[c]]).flatten()
+            else:
+                # custom transformer: feed it a Series
+                tf.fit(self.df[c])
+                arr = tf.transform(self.df[c])
+
+            self.transformers[c] = tf
+            num_arr.append(arr)
+        X_num = np.column_stack(num_arr) if num_arr else np.zeros((len(self.df), 0))
+
         self.cat_maps = {}
         cat_arrs = []
         for c in self.cat_cols:
@@ -178,8 +217,31 @@ class VAEPipeline:
                 x_hat, mu, logvar = self.model(xb)
                 recon = F.mse_loss(x_hat, xb)
                 kl = -0.5*torch.mean(1+logvar-mu.pow(2)-logvar.exp())
-                corr_hat = self._corr(x_hat[:,:len(self.num_cols)])
+
+                # 1) numeric part
+                num_hat = x_hat[:, : len(self.num_cols)]
+
+                # 2) categorical “soft codes”
+                cat_hat_parts = []
+                idx = len(self.num_cols)
+                for c in self.cat_cols:
+                    k = len(self.cat_maps[c])  # number of categories for c
+                    logits = x_hat[:, idx: idx + k]  # decoder outputs for this field
+                    probs = torch.softmax(logits, dim=1)
+                    # compute a “soft index” in [0…k-1]
+                    idx_vals = torch.arange(k, device=logits.device, dtype=probs.dtype)
+                    code = (probs * idx_vals).sum(dim=1)
+                    # scale to [-1,1], matching orig_corr’s scaling
+                    code_s = code / (k - 1) * 2 - 1
+                    cat_hat_parts.append(code_s.unsqueeze(1))
+                    idx += k
+
+                # 3) assemble full and compute correlation
+                x_corr = torch.cat([num_hat] + cat_hat_parts, dim=1)  # shape [batch, 23]
+                corr_hat = self._corr(x_corr)
+
                 corr_loss = F.mse_loss(corr_hat, self.orig_corr)
+
                 mmd_loss = self._mmd(xb[:,:len(self.num_cols)], x_hat[:,:len(self.num_cols)])
                 loss = recon + self.cfg.beta_kl*kl + self.cfg.lambda_corr*corr_loss + self.cfg.lambda_mmd*mmd_loss
                 opt.zero_grad(); loss.backward(); opt.step()
@@ -281,15 +343,14 @@ class VAEPipeline:
         idx=0; data={}
         # numeric
         for c in self.num_cols:
-            v=x_fake[:,idx]; idx+=1
-            orig=self.scalers[c].inverse_transform(v.reshape(-1,1)).flatten()
-            # clamp within original min/max
-            mn,mx=self.df[c].min(),self.df[c].max()
-            if self.meta[c].data_type==DataType.INTEGER:
-                arr=np.clip(np.round(orig),mn,mx).astype(int)
+            v=x_fake[:,idx]
+            idx+=1
+            v_clipped = np.clip(v, -1.0, 1.0)
+            arr = self.transformers[c].inverse(v_clipped)
+            if self.meta[c].data_type == DataType.INTEGER:
+                arr = arr.round().astype(int)
             else:
-                arr=np.round(orig,self.meta[c].decimal_places or 2)
-                arr=np.clip(arr,mn,mx)
+                arr = arr.round(self.meta[c].decimal_places or 2)
             data[c]=arr
         # categorical
         for c in self.cat_cols:
@@ -300,7 +361,12 @@ class VAEPipeline:
         for c in self.date_cols:
             v=x_fake[:,idx]; idx+=1
             frac=(v+1)/2; base=self.df[c].min(); span=(self.df[c].max()-base).total_seconds()
-            data[c]=[base+pd.to_timedelta(f*span,'s') for f in frac]
+            dates = [base+pd.to_timedelta(f*span,'s') for f in frac]
+            # Format datetime using the format specified in metadata
+            if self.meta[c].datetime_format:
+                data[c] = [date.strftime(self.meta[c].datetime_format) for date in dates]
+            else:
+                data[c] = dates
         # string
         for c in self.str_cols:
             method=self.meta[c].faker_method or self.cfg.faker.word; args=self.meta[c].faker_args

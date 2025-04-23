@@ -52,7 +52,19 @@ def generate_report(real: pd.DataFrame, synth: pd.DataFrame, meta: Dict[str, Fie
         corr1 = df1.corr()
         corr2 = df2.corr()
         diff = (corr1 - corr2).abs()
-        mae = mean_absolute_error(corr1.values.flatten(), corr2.values.flatten())
+
+        # Handle NaN values before calculating MAE
+        corr1_flat = corr1.values.flatten()
+        corr2_flat = corr2.values.flatten()
+
+        # Only use non-NaN values for MAE calculation
+        mask = ~(np.isnan(corr1_flat) | np.isnan(corr2_flat))
+        if mask.sum() > 0:
+            mae = mean_absolute_error(corr1_flat[mask], corr2_flat[mask])
+        else:
+            # If all pairs have NaNs, set MAE to NaN or a default value
+            mae = np.nan
+            LOGGER.warning(f"All correlation pairs contain NaN values for {filename_prefix}")
 
         fig, axes = plt.subplots(1, 3, figsize=(18, 5))
         for i, (mat, title) in enumerate(zip([corr1, corr2, diff], ["Real", "Synthetic", "Difference"])):
@@ -66,12 +78,27 @@ def generate_report(real: pd.DataFrame, synth: pd.DataFrame, meta: Dict[str, Fie
         for i, cat_col in enumerate(cat_cols):
             for j, num_col in enumerate(num_cols):
                 try:
+                    # Check for non-numeric or all-NaN columns
+                    if df[num_col].dtype.kind not in 'iuf' or df[num_col].isna().all():
+                        eta[i, j] = np.nan
+                        continue
+                        
                     groups = df.groupby(cat_col)[num_col]
-                    eta[i, j] = np.nan_to_num(
-                        sum(len(g) * (g.mean() - df[num_col].mean()) ** 2 for _, g in groups) /
-                        ((df[num_col] - df[num_col].mean()) ** 2).sum()
-                    )
-                except:
+                    
+                    # Calculate numerator: sum of between-group variance
+                    numerator = sum(len(g) * (g.mean() - df[num_col].mean()) ** 2 for _, g in groups)
+                    
+                    # Calculate denominator: total sum of squares
+                    denominator = ((df[num_col] - df[num_col].mean()) ** 2).sum()
+                    
+                    # Safe division
+                    if denominator > 1e-10:  # Add a small epsilon to avoid division by zero
+                        eta[i, j] = numerator / denominator
+                    else:
+                        LOGGER.warning(f"Near-zero denominator in eta_squared calculation for {cat_col} vs {num_col}")
+                        eta[i, j] = 0.0  # Set to zero if the denominator is too small
+                except Exception as e:
+                    LOGGER.warning(f"Error in eta_squared calculation for {cat_col} vs {num_col}: {str(e)}")
                     eta[i, j] = np.nan
         return eta
 

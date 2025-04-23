@@ -4,5 +4,6 @@
 from . import dataset_loader
 from . import vae
 from . import gan
+from . import transformers
 
-__all__ = ['gan','vae','dataset_loader']
+__all__ = ['gan', 'vae', 'dataset_loader', 'transformers']
