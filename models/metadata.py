@@ -26,7 +26,7 @@ metadata_airline = {
     'Cleanliness': FieldMetadata(DataType.INTEGER),
     'Departure Delay in Minutes': FieldMetadata(DataType.INTEGER, sampling='empirical', transformer = 'zero_inflated'),
     'Arrival Delay in Minutes': FieldMetadata(DataType.DECIMAL, decimal_places=1, sampling='empirical', transformer = 'zero_inflated'),
-    'satisfaction': FieldMetadata(DataType.CATEGORICAL, sampling='empirical'),
+    'is_satisfied': FieldMetadata(DataType.BOOLEAN, sampling='empirical'),
 }
 
 metadata_helthcare = {

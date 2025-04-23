@@ -14,7 +14,7 @@ class FieldMetadata:
             max_value: Optional[float] = None,
 
             # categorical/boolean fields
-            #  - "uniform" → np.random.randint (old behavior)
+            #  - "uniform" → np.random.randint
             #  - "empirical" → sample according to real data frequencies
             sampling: Literal["uniform", "empirical"] = "uniform",
 

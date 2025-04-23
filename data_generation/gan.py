@@ -1,5 +1,5 @@
 """
-Improved WGAN‑GP for tabular data
+Improved GAN‑GP for tabular data
 ================================
 • λ (GP‑weight) lowered to 2.5 because spectral‑norm is used
 • ε‑drift penalty keeps critic outputs bounded without mean‑centering
@@ -60,17 +60,17 @@ class GanConfig:
     hidden_g: int = 512
     hidden_d: int = 384
     batch_size: int = 256
-    n_critic_initial: int = 5
-    gp_weight: float = 4.0
+    n_critic_initial: int = 4
+    gp_weight: float = 2.5
     drift_epsilon: float = 5e-4
-    g_lr: float = 2e-4
-    d_lr: float = 4e-4
-    max_epochs: int = 300
+    g_lr: float = 1e-4
+    d_lr: float = 2e-4
+    epochs: int = 500
     seed: int = 42
     # cosine schedule
     lr_min_ratio: float = 0.05
     # early stop
-    patience: int = 200
+    patience: int = 320
     # gumbel
     tau_start: float = 2.5
     tau_end: float = 0.25
@@ -356,7 +356,7 @@ class _Discriminator(nn.Module):
 # ------------------------------------------------------------------#
 
 
-class WGAN:
+class GAN:
     def __init__(self, real: pd.DataFrame, meta: Dict[str, FieldMetadata], cfg: GanConfig):
         self.cfg, self.meta, self.faker = cfg, meta, Faker()
         _set_seed(cfg.seed)
@@ -435,7 +435,7 @@ class WGAN:
         LOGGER.info("Real tensor %s", X.shape)
 
         steps_per_epoch = math.ceil(len(self.loader))
-        total_steps = cfg.max_epochs * steps_per_epoch
+        total_steps = cfg.epochs * steps_per_epoch
         cond_dim = sum(self.cat_sizes)
 
         self.G = _Generator(cfg, len(self.num_cols) + len(self.dt_cols), self.cat_sizes, total_steps).to(DEVICE)
@@ -443,8 +443,8 @@ class WGAN:
 
         self.opt_g = torch.optim.Adam(self.G.parameters(), lr=cfg.g_lr, betas=(0.0, 0.9))
         self.opt_d = torch.optim.Adam(self.D.parameters(), lr=cfg.d_lr, betas=(0.0, 0.9))
-        self.sch_g = CosineAnnealingLR(self.opt_g, cfg.max_epochs, eta_min=cfg.g_lr * cfg.lr_min_ratio)
-        self.sch_d = CosineAnnealingLR(self.opt_d, cfg.max_epochs, eta_min=cfg.d_lr * cfg.lr_min_ratio)
+        self.sch_g = CosineAnnealingLR(self.opt_g, cfg.epochs, eta_min=cfg.g_lr * cfg.lr_min_ratio)
+        self.sch_d = CosineAnnealingLR(self.opt_d, cfg.epochs, eta_min=cfg.d_lr * cfg.lr_min_ratio)
 
         self.scaler_g = torch.amp.GradScaler("cuda", enabled=True)
         self.scaler_d = torch.amp.GradScaler("cuda", enabled=True)
@@ -454,7 +454,7 @@ class WGAN:
         self.n_critic = cfg.n_critic_initial
 
     # ------------------------------------------------------------------#
-    def fit(self, verbose=True):
+    def fit(self, verbose=False):
         # ── 0) split the full real→tensor dataset into train/val ───────────────
         #    we already built self.loader.dataset.tensors[0] as X_all
         X_all = self.loader.dataset.tensors[0]  # torch.Tensor [N, features]
@@ -488,11 +488,11 @@ class WGAN:
             'n_critic': [],
             'lr_d': [],
             'lr_g': [],
-            'val_wd': {c: [] for c in self.num_cols + self.dt_cols},
+            'val_wd': { c: [] for c in (self.num_cols + self.dt_cols) },
         }
     
-        # ── 1) the usual WGAN training loop ────────────────────────────────────
-        for epoch in range(1, self.cfg.max_epochs + 1):
+        # ── 1) the usual GAN training loop ────────────────────────────────────
+        for epoch in range(1, self.cfg.epochs + 1):
             d_sum = g_sum = w_sum = 0.0
     
             for i, (real_batch,) in enumerate(self.loader, 1):
@@ -568,7 +568,6 @@ class WGAN:
                 # Plot progress if configured
                 if epoch % self.cfg.plot_interval == 0:
                     self.plot_training_metrics()
-                    self.plot_distributions(syn, cols=min(3, len(self.num_cols)))
     
             # ── 3) early‐stop on W‐EMA if you like ────────────────────────────────
             w_est = -d_mean
@@ -781,139 +780,8 @@ class WGAN:
         plt.tight_layout()
         
         # Save if configured
-        if self.cfg.save_plots:
-            plt.savefig(f'wgan_training_metrics_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png', dpi=300)
-            
-        plt.show()
-        
-        # Plot validation Wasserstein distances if available
-        val_features = [c for c in self.metrics['val_wd'] if self.metrics['val_wd'][c]]
-        if val_features:
-            # Determine number of rows needed (max 3 features per row)
-            n_features = len(val_features)
-            n_rows = (n_features + 2) // 3
-            
-            plt.figure(figsize=(15, 4 * n_rows))
-            
-            for i, feature in enumerate(val_features):
-                data = self.metrics['val_wd'][feature]
-                if not data:
-                    continue
-                    
-                epochs, wds = zip(*data)
-                
-                plt.subplot(n_rows, 3, i + 1)
-                plt.plot(epochs, wds, 'b-o')
-                plt.title(f'Validation WD: {feature}')
-                plt.xlabel('Epoch')
-                plt.ylabel('Wasserstein Distance')
-                plt.grid(True, alpha=0.3)
-                plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
-            
-            plt.tight_layout()
-            
-            if self.cfg.save_plots:
-                plt.savefig(f'wgan_validation_wd_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png', dpi=300)
-                
-            plt.show()
-    
-    def plot_distributions(self, synthetic_df=None, cols=None, samples=None, figsize=(15, 12)):
-        """
-        Plot distributions of real vs. generated data for numerical features.
-        
-        Parameters:
-            synthetic_df: DataFrame of synthetic data. If None, generates new data.
-            cols: Number of columns to plot. If None, plots all numerical columns.
-            samples: Number of samples to generate if synthetic_df is None.
-            figsize: Figure size tuple.
-        """
-        # If no synthetic data provided, generate some
-        if synthetic_df is None:
-            samples = samples or self.cfg.plot_samples
-            synthetic_df = self.generate(samples)
-        
-        # Determine which numerical columns to plot
-        num_features = self.num_cols
-        if not num_features:
-            LOGGER.warning("No numerical features available to plot")
-            return
-            
-        if cols is not None:
-            num_features = num_features[:cols]
-        
-        # Determine layout
-        n_features = len(num_features)
-        n_rows = (n_features + 2) // 3  # Up to 3 plots per row
-        
-        plt.figure(figsize=figsize)
-        
-        for i, col in enumerate(num_features):
-            plt.subplot(n_rows, 3, i + 1)
-            
-            # Plot real data distribution
-            real_vals = self.real_df[col].values
-            plt.hist(real_vals, bins=30, alpha=0.5, label='Real', density=True)
-            
-            # Plot synthetic data distribution
-            syn_vals = synthetic_df[col].values
-            plt.hist(syn_vals, bins=30, alpha=0.5, label='Synthetic', density=True)
-            
-            plt.title(f'Distribution: {col}')
-            plt.xlabel(col)
-            plt.ylabel('Density')
-            plt.legend()
-            plt.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        if self.cfg.save_plots:
-            plt.savefig(f'wgan_distributions_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png', dpi=300)
-            
-        plt.show()
-        
-        # If there are enough numeric features, plot correlation matrix comparison
-        if len(num_features) >= 2:
-            self.plot_correlation_matrix(synthetic_df, features=num_features)
-    
-    def plot_correlation_matrix(self, synthetic_df=None, features=None, figsize=(15, 6)):
-        """
-        Plot correlation matrices for real and synthetic data side-by-side.
-        
-        Parameters:
-            synthetic_df: DataFrame of synthetic data. If None, generates new data.
-            features: List of features to include in correlation matrix.
-            figsize: Figure size tuple.
-        """
-        # If no synthetic data provided, generate some
-        if synthetic_df is None:
-            synthetic_df = self.generate(self.cfg.plot_samples)
-        
-        # If features not specified, use all numeric columns
-        if features is None:
-            features = self.num_cols
-            
-        if len(features) < 2:
-            LOGGER.warning("Need at least 2 features to plot correlation matrix")
-            return
-        
-        plt.figure(figsize=figsize)
-        
-        # Real data correlation matrix
-        plt.subplot(1, 2, 1)
-        real_corr = self.real_df[features].corr()
-        sns.heatmap(real_corr, annot=True, cmap='coolwarm', vmin=-1, vmax=1, fmt='.2f')
-        plt.title('Real Data Correlation Matrix')
-        
-        # Synthetic data correlation matrix
-        plt.subplot(1, 2, 2)
-        syn_corr = synthetic_df[features].corr()
-        sns.heatmap(syn_corr, annot=True, cmap='coolwarm', vmin=-1, vmax=1, fmt='.2f')
-        plt.title('Synthetic Data Correlation Matrix')
-        
-        plt.tight_layout()
-        
-        if self.cfg.save_plots:
-            plt.savefig(f'wgan_correlation_matrix_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png', dpi=300)
+        # if self.cfg.save_plots:
+        #    plt.savefig(f'gan_training_metrics_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png', dpi=300)
             
         plt.show()
 
@@ -923,20 +791,20 @@ def _set_seed(s):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(s)
 
-def visualize_wgan_training(wgan_model):
+def visualize_gan_training(gan_model):
     """
-    Visualize WGAN training metrics and generated data.
+    Visualize GAN training metrics and generated data.
     
     Parameters:
-        wgan_model: Trained WGAN model
+        gan_model: Trained GAN model
     """
     # Plot overall training metrics
-    wgan_model.plot_training_metrics()
+    gan_model.plot_training_metrics()
     
     # Generate synthetic data and plot distributions
-    synthetic_data = wgan_model.generate(wgan_model.cfg.plot_samples)
-    wgan_model.plot_distributions(synthetic_data)
+    synthetic_data = gan_model.generate(gan_model.cfg.plot_samples)
+    gan_model.plot_distributions(synthetic_data)
     
     # Plot correlation matrices
-    if len(wgan_model.num_cols) >= 2:
-        wgan_model.plot_correlation_matrix(synthetic_data)
+    if len(gan_model.num_cols) >= 2:
+        gan_model.plot_correlation_matrix(synthetic_data)

@@ -22,7 +22,7 @@ daily = df.rename(columns={'dt': 'Date', 'Global_active_power': 'Value'})
 # ——— 2. Build metadata for the single series
 meta = metadata_power_consumption
 
-# ——— 3. Train your WGAN
+# ——— 3. Train your GAN
 gan = WGAN(real=daily[['Value']], meta=meta,
            cfg=GanConfig(max_epochs=200))
 gan.fit()

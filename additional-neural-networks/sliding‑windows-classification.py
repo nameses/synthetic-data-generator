@@ -33,7 +33,7 @@ meta = {
     for c in cols
 }
 
-# ——— 5. Train WGAN on ALL windows
+# ——— 5. Train GAN on ALL windows
 gan = WGAN(real=W_df, meta=meta, cfg=GanConfig(max_epochs=150))
 gan.fit()
 

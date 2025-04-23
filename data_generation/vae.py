@@ -1,5 +1,8 @@
 # vae_pipeline.py
+import logging
 import os
+from datetime import datetime
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,6 +15,13 @@ from typing import Dict, List
 
 from models.enums import DataType
 from models.field_metadata import FieldMetadata
+
+ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+fh = logging.FileHandler(f"train_{ts}.log", mode="w", encoding="utf‑8")
+fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+
+LOGGER = logging.getLogger(__name__)
+LOGGER.addHandler(fh)
 
 class VAEConfig:
     """
@@ -138,7 +148,7 @@ class VAEPipeline:
         except:
             return False
 
-    def train(self, verbose=None):
+    def fit(self, verbose=None):
         # Use class verbose setting if not specified
         if verbose is None:
             verbose = self.cfg.verbose
@@ -149,15 +159,7 @@ class VAEPipeline:
             'train_total': [], 'train_recon': [], 'train_kl': [], 'train_corr': [], 'train_mmd': [],
             'val_loss': []
         }
-        
-        # Setup visualization
-        fig, axes = None, None
-        if self._is_in_notebook():
-            import matplotlib.pyplot as plt
-            from IPython.display import display, clear_output
-            plt.ion()
-            fig, axes = plt.subplots(3, 1, figsize=(12, 15))
-            
+
         dataset = TensorDataset(self.X)
         train_ds, val_ds = random_split(dataset, [int(0.9*len(dataset)), len(dataset)-int(0.9*len(dataset))])
         train_loader = DataLoader(train_ds, batch_size=self.cfg.batch_size, shuffle=True)
@@ -215,88 +217,50 @@ class VAEPipeline:
             if val_loss<best_val:
                 best_val=val_loss
                 torch.save(self.model.state_dict(),f"checkpoints/vae_best_epoch{epoch}.pt")
-                if verbose: print(f"Checkpoint saved: epoch {epoch}, val_loss={val_loss:.4f}")
-            if verbose:
-                print(f"Epoch {epoch:03d} | LR:{lr:.6f} | Train Loss:{train_total:.4f}"
-                      f" (Recon:{train_recon:.4f}, KL:{train_kl:.4f},"
-                      f" Corr:{train_corr:.4f}, MMD:{train_mmd:.4f}) | Val Loss:{val_loss:.4f}")
-                      
-            # Update visualization every 5 epochs if in notebook
-            if epoch % 5 == 0 and fig is not None:
-                try:
-                    clear_output(wait=True)
-                    
-                    # Plot total loss
-                    axes[0].clear()
-                    axes[0].plot(metrics['epoch'], metrics['train_total'], 'b-', label='Train Total')
-                    axes[0].plot(metrics['epoch'], metrics['val_loss'], 'r-', label='Validation')
-                    axes[0].set_ylabel('Total Loss')
-                    axes[0].set_title('VAE Training Progress')
-                    axes[0].legend()
-                    axes[0].grid(True)
-                    
-                    # Plot component losses
-                    axes[1].clear()
-                    axes[1].plot(metrics['epoch'], metrics['train_recon'], 'g-', label='Reconstruction')
-                    axes[1].plot(metrics['epoch'], metrics['train_kl'], 'r-', label='KL Divergence')
-                    axes[1].set_ylabel('Loss Components')
-                    axes[1].legend()
-                    axes[1].grid(True)
-                    
-                    # Plot correlation and MMD losses
-                    axes[2].clear()
-                    axes[2].plot(metrics['epoch'], metrics['train_corr'], 'c-', label='Correlation')
-                    axes[2].plot(metrics['epoch'], metrics['train_mmd'], 'm-', label='MMD')
-                    axes[2].set_xlabel('Epoch')
-                    axes[2].set_ylabel('Regularization Losses')
-                    axes[2].legend()
-                    axes[2].grid(True)
-                    
-                    plt.tight_layout()
-                    display(fig)
-                    plt.pause(0.1)
-                except Exception as e:
-                    if verbose:
-                        print(f"Failed to plot metrics: {e}")
-                        
-        # Final plot
-        if fig is not None:
-            try:
-                clear_output(wait=True)
-                
-                # Plot total loss
-                axes[0].clear()
-                axes[0].plot(metrics['epoch'], metrics['train_total'], 'b-', label='Train Total')
-                axes[0].plot(metrics['epoch'], metrics['val_loss'], 'r-', label='Validation')
-                axes[0].set_ylabel('Total Loss')
-                axes[0].set_title('VAE Training Summary')
-                axes[0].legend()
-                axes[0].grid(True)
-                
-                # Plot component losses
-                axes[1].clear()
-                axes[1].plot(metrics['epoch'], metrics['train_recon'], 'g-', label='Reconstruction')
-                axes[1].plot(metrics['epoch'], metrics['train_kl'], 'r-', label='KL Divergence')
-                axes[1].set_ylabel('Loss Components')
-                axes[1].legend()
-                axes[1].grid(True)
-                
-                # Plot correlation and MMD losses
-                axes[2].clear()
-                axes[2].plot(metrics['epoch'], metrics['train_corr'], 'c-', label='Correlation')
-                axes[2].plot(metrics['epoch'], metrics['train_mmd'], 'm-', label='MMD')
-                axes[2].set_xlabel('Epoch')
-                axes[2].set_ylabel('Regularization Losses')
-                axes[2].legend()
-                axes[2].grid(True)
-                
-                plt.tight_layout()
-                display(fig)
-                plt.pause(0.1)
-            except Exception as e:
                 if verbose:
-                    print(f"Failed to plot final metrics: {e}")
-                    
+                    LOGGER.info("Checkpoint saved: epoch %d, val_loss=%.4f", epoch, val_loss)
+            if verbose:
+                LOGGER.info("Epoch %03d | LR:%.6f | Train Loss:%.4f (Recon:%.4f, KL:%.4f, Corr:%.4f, MMD:%.4f) | Val Loss:%.4f",
+                        epoch, lr, train_total, train_recon, train_kl, train_corr, train_mmd, val_loss)
+
+        import matplotlib.pyplot as plt
+
+        # 1) Total vs Validation loss
+        plt.figure(figsize=(10, 5))
+        plt.plot(metrics['epoch'], metrics['train_total'], label='Train Total')
+        plt.plot(metrics['epoch'], metrics['val_loss'], label='Validation')
+        plt.title('VAE Total Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+
+        # 2) Reconstruction & KL divergence
+        plt.figure(figsize=(10, 5))
+        plt.plot(metrics['epoch'], metrics['train_recon'], label='Reconstruction')
+        plt.plot(metrics['epoch'], metrics['train_kl'], label='KL Divergence')
+        plt.title('VAE Reconstruction & KL Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+
+        # 3) Correlation & MMD regularization terms
+        plt.figure(figsize=(10, 5))
+        plt.plot(metrics['epoch'], metrics['train_corr'], label='Correlation Loss')
+        plt.plot(metrics['epoch'], metrics['train_mmd'], label='MMD Loss')
+        plt.title('VAE Regularization Losses')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+
         return metrics
 
     def _postprocess(self, df: pd.DataFrame) -> pd.DataFrame:
