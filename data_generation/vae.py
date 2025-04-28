@@ -38,12 +38,12 @@ class VAEConfig:
     # KL annealing
     beta_start: float = 0.0
     beta_end: float = 1.0
-    kl_anneal: str = "linear"
+    kl_anneal: str = "cyclic"
     kl_cycles: int = 4
-    kl_ratio: float = 0.5
+    kl_ratio: float = 0.25
     kl_warmup_epochs: int = 60
     # regularisation weights
-    corr_weight: float = 2.0  # stronger correlation match
+    corr_weight: float = 4.0  # stronger correlation match
     moment_weight: float = 1.0  # lightly nudge moments – we rely on quantile mapping instead
     # gumbel
     use_gumbel: bool = True
@@ -165,10 +165,16 @@ class VAEPipeline:
     def _reparam(self, mu, lv):
         std = torch.exp(0.5 * lv); return mu + std * torch.randn_like(std)
     def _beta(self,e):
-        if self.cfg.kl_anneal=='linear':
-            t=min(e,self.cfg.kl_warmup_epochs); return self.cfg.beta_start + (self.cfg.beta_end - self.cfg.beta_start)*t/self.cfg.kl_warmup_epochs
-        cycle=self.cfg.epochs//self.cfg.kl_cycles; pos=(e-1)%cycle; ramp=min(1.0,pos/(cycle*self.cfg.kl_ratio))
-        return self.cfg.beta_start + ramp*(self.cfg.beta_end - self.cfg.beta_start)
+        cycle_len = self.cfg.epochs // self.cfg.kl_cycles
+        phase = (e - 1) % cycle_len
+        beta = 0.0 if phase < int(cycle_len * (1 - self.cfg.kl_ratio)) \
+            else (phase - int(cycle_len * (1 - self.cfg.kl_ratio))) / (cycle_len * self.cfg.kl_ratio)
+        beta *= self.cfg.beta_end
+        return beta
+        # if self.cfg.kl_anneal=='linear':
+        #     t=min(e,self.cfg.kl_warmup_epochs); return self.cfg.beta_start + (self.cfg.beta_end - self.cfg.beta_start)*t/self.cfg.kl_warmup_epochs
+        # cycle=self.cfg.epochs//self.cfg.kl_cycles; pos=(e-1)%cycle; ramp=min(1.0,pos/(cycle*self.cfg.kl_ratio))
+        # return self.cfg.beta_start + ramp*(self.cfg.beta_end - self.cfg.beta_start)
 
     # ------------------------------------------------------------------
     def fit(self, verbose: bool=False):

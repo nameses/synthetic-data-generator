@@ -55,7 +55,7 @@ def main():
         # synthetic_data = generator.generate(synthetic_size)
         # logger.info(f"Generated synthetic data with shape: {synthetic_data.shape}")
 
-        vae_cfg = VAEConfig(epochs=10)
+        vae_cfg = VAEConfig(epochs=100)
         vae_pipe = VAEPipeline(df=real_data, meta=metadata_airline, cfg=vae_cfg)
         vae_pipe.fit(True)
         synthetic_data = vae_pipe.generate(30000)
