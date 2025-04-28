@@ -13,4 +13,5 @@ datasets/
 additional-neural-networks/*.csv
 
 checkpoints/
+.ipynb_checkpoints
 Readme.md

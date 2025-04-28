@@ -177,6 +177,34 @@ class _BoundedTf(_BaseTf):
         raw = norm * (self.max_val - self.min_val) + self.min_val
         return pd.Series(raw)
 
+class _ContSmoothTf(_BaseTf):
+    """Rank‑gauss with light tail‑clipping for stability."""
+
+    def fit(self, s):
+        q_low, q_hi = s.quantile([0.0025, 0.9975])
+        self.sorted_ = np.sort(s.clip(q_low, q_hi).to_numpy(copy=True))
+        return self
+
+    def transform(self, s):
+        u = rankdata(s, method="average") / (len(s) + 1)
+        return norm.ppf(u)
+
+    def inverse(self, v):
+        u = norm.cdf(v).clip(0, 1)
+        positions = u * (len(self.sorted_) - 1)
+        low = np.floor(positions).astype(int)
+        high = np.ceil(positions).astype(int)
+        frac = positions - low
+        vals = np.empty_like(u)
+        same = low == high
+        vals[same] = self.sorted_[low[same]]
+        mask = ~same
+        vals[mask] = (
+                self.sorted_[low[mask]] * (1 - frac[mask]) +
+                self.sorted_[high[mask]] * frac[mask]
+        )
+        return pd.Series(vals)
+
 class _ContTf(_BaseTf):
     """Rank‑gauss with light tail‑clipping for stability."""
 
@@ -196,6 +224,15 @@ class _ContTf(_BaseTf):
 
 
 class _DtTf(_ContTf):
+    def __init__(self, fmt): self.fmt = fmt
+    def fit(self, s):  return super().fit(self._to_sec(s))
+    def transform(self, s): return super().transform(self._to_sec(s))
+    def inverse(self, v):
+        return pd.to_datetime(super().inverse(v), unit="s").dt.strftime(self.fmt)
+    def _to_sec(self, s):
+        return pd.to_datetime(s, format=self.fmt, errors="coerce").astype("int64") // 10**9
+
+class _DtSmoothTf(_ContSmoothTf):
     def __init__(self, fmt): self.fmt = fmt
     def fit(self, s):  return super().fit(self._to_sec(s))
     def transform(self, s): return super().transform(self._to_sec(s))

@@ -36,3 +36,5 @@ class FieldMetadata:
         self.faker_args = faker_args or {}
 
         self.datetime_format = datetime_format
+
+        self.transformer = transformer
