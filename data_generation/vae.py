@@ -43,8 +43,9 @@ class VAEConfig:
     kl_ratio: float = 0.25
     kl_warmup_epochs: int = 60
     # regularisation weights
-    corr_weight: float = 4.0  # stronger correlation match
-    moment_weight: float = 1.0  # lightly nudge moments – we rely on quantile mapping instead
+    corr_weight: float = 3.0
+    catnum_weight: float = 20.0
+    moment_weight: float = 1.0
     # gumbel
     use_gumbel: bool = True
     tau_start: float = 2.5
@@ -101,7 +102,8 @@ class Decoder(nn.Module):
         self.step += 1
         out = [num] if num is not None else []
         for lg in logits:
-            out.append(F.gumbel_softmax(lg, tau=tau, hard=hard) if self.cfg.use_gumbel else F.softmax(lg, 1))
+            out.append(F.gumbel_softmax(lg, tau=tau, hard=hard)
+                       if self.cfg.use_gumbel else F.softmax(lg, 1))
         return torch.cat(out, 1)
 
 # --------------------------------------------------
@@ -147,7 +149,10 @@ class VAEPipeline:
         X = torch.tensor(np.vstack(mats).T, dtype=torch.float32)
         cat_idx = torch.tensor(np.vstack(cat_idx_mat).T, dtype=torch.long)
         self.loader = DataLoader(TensorDataset(X, cat_idx), cfg.batch_size, shuffle=True, drop_last=True)
-        self.num_out = len(self.num_cols) + len(self.dt_cols); self.cond_dim = sum(self.cat_sizes)
+        self.num_out = len(self.num_cols) + len(self.dt_cols)
+        self.cond_dim = sum(self.cat_sizes)
+        self.cat_offset = self.num_out
+
         steps = cfg.epochs * math.ceil(len(self.loader))
         self.encoder = Encoder(X.shape[1], cfg.hidden_dims, cfg.latent_dim, cfg.dropout).to(DEVICE)
         self.decoder = Decoder(cfg, self.num_out, self.cat_sizes, steps).to(DEVICE)
@@ -171,10 +176,15 @@ class VAEPipeline:
             else (phase - int(cycle_len * (1 - self.cfg.kl_ratio))) / (cycle_len * self.cfg.kl_ratio)
         beta *= self.cfg.beta_end
         return beta
-        # if self.cfg.kl_anneal=='linear':
-        #     t=min(e,self.cfg.kl_warmup_epochs); return self.cfg.beta_start + (self.cfg.beta_end - self.cfg.beta_start)*t/self.cfg.kl_warmup_epochs
-        # cycle=self.cfg.epochs//self.cfg.kl_cycles; pos=(e-1)%cycle; ramp=min(1.0,pos/(cycle*self.cfg.kl_ratio))
-        # return self.cfg.beta_start + ramp*(self.cfg.beta_end - self.cfg.beta_start)
+
+    def _batch_group_means(self, one_hot: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
+        """
+        one_hot : (B, K)   – category indicators (hard or soft)
+        values  : (B,)     – numeric column
+        returns : (K,)     – mean of *values* for every category
+        """
+        weights = one_hot.sum(0).clamp_min(1.0)  # avoid /0
+        return (one_hot.T @ values) / weights  # (K,)
 
     # ------------------------------------------------------------------
     def fit(self, verbose: bool=False):
@@ -183,7 +193,13 @@ class VAEPipeline:
             sums = {k:0.0 for k in self.metrics}
             for x, ci in self.loader:
                 x, ci = x.to(DEVICE), ci.to(DEVICE)
-                mu, lv = self.encoder(x); z = self._reparam(mu, lv); cond = x[:, self.num_out:self.num_out+self.cond_dim]
+                mu, lv = self.encoder(x)
+                z = self._reparam(mu, lv)
+                teacher_ratio = max(0.0, 1.0 - ep / (self.cfg.epochs * 0.6))
+                use_teacher = (torch.rand(self.cfg.batch_size, 1, device=DEVICE) < teacher_ratio)  # still bool
+                cond = x[:, self.num_out: self.num_out + self.cond_dim]
+                # invert with ~, then cast to float
+                cond = cond * use_teacher.float() + 0.0 * (~use_teacher).float()
                 u, logits = self.decoder(z, cond)
                 # scaled reconstruction
                 rec = F.mse_loss((u - x[:, :self.num_out]) / self.num_stds, torch.zeros_like(u))
@@ -191,9 +207,78 @@ class VAEPipeline:
                 cat = sum(F.cross_entropy(lg, ci[:, i].clamp(0, lg.size(1)-1)) for i, lg in enumerate(logits)) / len(logits)
                 # KL
                 kl = -0.5 * torch.mean(torch.sum(1 + lv - mu.pow(2) - lv.exp(), 1)) * self._beta(ep)
-                # correlation (Pearson on logits‑free numeric)
-                corr = self.cfg.corr_weight * F.mse_loss(torch.corrcoef(x[:, :self.num_out].T), torch.corrcoef(u.T))
-                loss = rec + cat + kl + corr
+
+                kl_cat = 0.0
+                for i, k in enumerate(self.cat_sizes):
+                    prior = torch.tensor(self.cat_probs[self.cat_cols[i]], device=DEVICE)
+                    kl_cat += F.kl_div(F.log_softmax(logits[i], 1), prior.repeat(self.cfg.batch_size, 1), reduction='batchmean')
+
+                catnum = 0.0
+                col_off = 0
+                x_num = x[:, :self.num_out]  # (B, N)
+                u_num = u  # (B, N)
+                for i, k in enumerate(self.cat_sizes):
+                    real_1h = x[:, self.num_out + col_off: self.num_out + col_off + k]  # (B, K)
+                    pred_1h = F.softmax(logits[i], 1)  # (B, K)
+                    col_off += k
+
+                    # (K, N) mean matrix for all numeric heads at once
+                    w_real = real_1h.sum(0).clamp_min(1.0).unsqueeze(1)  # (K, 1)
+                    w_pred = pred_1h.sum(0).clamp_min(1.0).unsqueeze(1)
+
+                    m_real = real_1h.T @ x_num / w_real  # (K, N)
+                    m_pred = pred_1h.T @ u_num / w_pred
+
+                    catnum += F.mse_loss(m_pred, m_real, reduction='mean')
+
+                catnum = catnum / len(self.cat_sizes)
+
+                # group variances
+                var_loss = torch.tensor(0.0, device=DEVICE)
+                col_off = 0
+                x_num = x[:, :self.num_out]  # (B, N)
+                u_num = u  # (B, N)
+                for i, k in enumerate(self.cat_sizes):
+                    real_1h = x[:, self.num_out + col_off: self.num_out + col_off + k]  # (B, K)
+                    pred_1h = F.softmax(logits[i], 1)  # (B, K)
+                    col_off += k
+
+                    # 1) expand to (B, N, K) so that we can do mask * value²
+                    real_mask = real_1h.unsqueeze(1)  # (B, 1, K)
+                    pred_mask = pred_1h.unsqueeze(1)  # (B, 1, K)
+                    x_sq = x_num.unsqueeze(2) ** 2  # (B, N, 1)
+                    u_sq = u_num.unsqueeze(2) ** 2  # (B, N, 1)
+
+                    # 2) sum over batch → (N, K)
+                    sq_real = (real_mask * x_sq).sum(0)
+                    sq_pred = (pred_mask * u_sq).sum(0)
+
+                    # 3) divide by counts (1, K) → (N, K)
+                    w_real = real_1h.sum(0).clamp_min(1.0).unsqueeze(0)
+                    w_pred = pred_1h.sum(0).clamp_min(1.0).unsqueeze(0)
+                    var_real_nk = sq_real / w_real  # (N, K)
+                    var_pred_nk = sq_pred / w_pred  # (N, K)
+
+                    # 4) transpose → (K, N) to match your m_real shape
+                    var_real = var_real_nk.T
+                    var_pred = var_pred_nk.T
+
+                    var_loss += F.mse_loss(var_pred, var_real, reduction='mean')
+
+                var_loss = var_loss / len(self.cat_sizes)
+
+                # Pearson-cov for numeric↔numeric (keeps shape)
+                corr = self.cfg.corr_weight * F.mse_loss(
+                    torch.corrcoef(x[:, :self.num_out].T),
+                    torch.corrcoef(u.T))
+
+                # pairwise category one-hot covariance
+                catcat = 0.0
+                block = torch.cat([F.softmax(lg, 1) for lg in logits], 1)  # (B, ΣK)
+                target = x[:, self.num_out: self.num_out + self.cond_dim]  # real one-hots
+                catcat = F.mse_loss(torch.corrcoef(block.T), torch.corrcoef(target.T))
+
+                loss = rec + cat + kl + corr + self.cfg.catnum_weight * catnum + 0.5 * catcat + 0.1 * kl_cat + 0.5 * var_loss
                 self.opt.zero_grad(); loss.backward(); self.opt.step()
                 for k,v in zip(self.metrics,(rec,cat,kl,corr,loss)): sums[k]+=v.item()
             for k in self.metrics: self.metrics[k].append(sums[k]/len(self.loader))
@@ -218,16 +303,26 @@ class VAEPipeline:
     def generate(self, n: int, temperature: float=1.0) -> pd.DataFrame:
         self.decoder.eval(); rows=[]; bs=self.cfg.batch_size
         with torch.no_grad():
-            for start in range(0,n,bs):
-                cur=min(bs, n-start)
-                z=torch.randn(cur, self.cfg.latent_dim, device=DEVICE)*temperature
-                # condition
-                cond=torch.zeros(cur, self.cond_dim, device=DEVICE); off=0
-                for i,c in enumerate(self.cat_cols):
-                    k=self.cat_sizes[i]; idx=np.random.choice(k,cur,p=self.cat_probs[c])
-                    cond[range(cur), off+idx]=1.0; off+=k
-                rows.append(self.decoder.sample(z,cond,True).cpu().numpy())
-        mat=np.vstack(rows)[:n]; data:Dict[str,List]= {}; ptr=0
+            for start in range(0, n, bs):
+                cur = min(bs, n - start)
+
+                # 1) Sample raw numeric+cat in one go (sample() uses its internal τ schedule)
+                z = torch.randn(cur, self.cfg.latent_dim, device=DEVICE) * temperature
+                out1 = self.decoder.sample(z,
+                                           torch.zeros(cur, self.cond_dim, device=DEVICE),
+                                           hard=True)  # shape (cur, num_out+cond_dim)
+                num1 = out1[:, :self.num_out]  # (cur, num_out)
+                cond_pred = out1[:, self.num_out:]  # (cur, cond_dim)
+
+                # 2) Re-forward numeric head with the predicted one-hots
+                num2, _ = self.decoder.forward(z, cond_pred)  # (cur, num_out)
+
+                # 3) Build final output matrix just like training data
+                dec_out = torch.cat([num2, cond_pred], dim=1).cpu().numpy()
+                rows.append(dec_out)
+        mat=np.vstack(rows)[:n]
+        data:Dict[str,List]= {}
+        ptr=0
 
         # ---- NUMERIC + DATETIME heads --------------------------------------
         ptr = 0
