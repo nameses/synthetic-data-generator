@@ -44,7 +44,7 @@ class VAEConfig:
     kl_warmup_epochs: int = 60
     # regularisation weights
     corr_weight: float = 3.0
-    catnum_weight: float = 20.0
+    catnum_weight: float = 15.0
     moment_weight: float = 1.0
     # gumbel
     use_gumbel: bool = True
@@ -189,101 +189,129 @@ class VAEPipeline:
     # ------------------------------------------------------------------
     def fit(self, verbose: bool=False):
         LOGGER.info("Training VAE for %d epochs", self.cfg.epochs)
-        for ep in range(1, self.cfg.epochs+1):
-            sums = {k:0.0 for k in self.metrics}
+        for ep in range(1, self.cfg.epochs + 1):
+            sums = {k: 0.0 for k in self.metrics}
+
             for x, ci in self.loader:
                 x, ci = x.to(DEVICE), ci.to(DEVICE)
                 mu, lv = self.encoder(x)
                 z = self._reparam(mu, lv)
-                teacher_ratio = max(0.0, 1.0 - ep / (self.cfg.epochs * 0.6))
-                use_teacher = (torch.rand(self.cfg.batch_size, 1, device=DEVICE) < teacher_ratio)  # still bool
-                cond = x[:, self.num_out: self.num_out + self.cond_dim]
-                # invert with ~, then cast to float
-                cond = cond * use_teacher.float() + 0.0 * (~use_teacher).float()
-                u, logits = self.decoder(z, cond)
-                # scaled reconstruction
-                rec = F.mse_loss((u - x[:, :self.num_out]) / self.num_stds, torch.zeros_like(u))
-                # categorical CE
-                cat = sum(F.cross_entropy(lg, ci[:, i].clamp(0, lg.size(1)-1)) for i, lg in enumerate(logits)) / len(logits)
-                # KL
-                kl = -0.5 * torch.mean(torch.sum(1 + lv - mu.pow(2) - lv.exp(), 1)) * self._beta(ep)
 
+                # ---------- STEP ① : unconditional category prediction ----------
+                zero_cond = torch.zeros(x.size(0), self.cond_dim, device=DEVICE)
+                _, logits_cat = self.decoder(z, zero_cond)  # (B, ΣK)
+                cat_soft_blocks = torch.cat(
+                    [F.softmax(lg, 1) for lg in logits_cat], 1)  # (B, ΣK)
+
+                # categorical CE (before any mixing)
+                cat = sum(
+                    F.cross_entropy(lg, ci[:, i].clamp(0, lg.size(1) - 1))
+                    for i, lg in enumerate(logits_cat)
+                ) / len(logits_cat)
+
+                # ---------- teacher-forcing schedule ----------
+                teacher_ratio = max(0.0, 1.0 - ep / (self.cfg.epochs * 0.7))
+                mask = (torch.rand(x.size(0), 1, device=DEVICE) < teacher_ratio).float()
+                real_cond = x[:, self.num_out: self.num_out + self.cond_dim]
+                cond_mix = real_cond * mask + cat_soft_blocks * (1.0 - mask)
+
+                # ---------- STEP ② : numeric / datetime prediction ----------
+                u, _ = self.decoder(z, cond_mix)  # (B, N)
+
+                # ---------- LOSSES ----------
+                rec = F.mse_loss(
+                    (u - x[:, :self.num_out]) / self.num_stds,
+                    torch.zeros_like(u)
+                )
+
+                # KL (latent)
+                beta = self._beta(ep)
+                kl = -0.5 * torch.mean(
+                    torch.sum(1 + lv - mu.pow(2) - lv.exp(), 1)
+                ) * beta
+
+                # KL (categorical vs empirical prior)
                 kl_cat = 0.0
                 for i, k in enumerate(self.cat_sizes):
                     prior = torch.tensor(self.cat_probs[self.cat_cols[i]], device=DEVICE)
-                    kl_cat += F.kl_div(F.log_softmax(logits[i], 1), prior.repeat(self.cfg.batch_size, 1), reduction='batchmean')
+                    kl_cat += F.kl_div(
+                        F.log_softmax(logits_cat[i], 1),
+                        prior.repeat(self.cfg.batch_size, 1),
+                        reduction="batchmean",
+                    )
 
+                # --- cat-num moment matching (uses *mixed* one-hots) ---
                 catnum = 0.0
                 col_off = 0
-                x_num = x[:, :self.num_out]  # (B, N)
-                u_num = u  # (B, N)
                 for i, k in enumerate(self.cat_sizes):
-                    real_1h = x[:, self.num_out + col_off: self.num_out + col_off + k]  # (B, K)
-                    pred_1h = F.softmax(logits[i], 1)  # (B, K)
+                    one_hot = cond_mix[:, col_off: col_off + k]  # (B, K)
                     col_off += k
 
-                    # (K, N) mean matrix for all numeric heads at once
-                    w_real = real_1h.sum(0).clamp_min(1.0).unsqueeze(1)  # (K, 1)
-                    w_pred = pred_1h.sum(0).clamp_min(1.0).unsqueeze(1)
-
-                    m_real = real_1h.T @ x_num / w_real  # (K, N)
-                    m_pred = pred_1h.T @ u_num / w_pred
-
-                    catnum += F.mse_loss(m_pred, m_real, reduction='mean')
+                    w = one_hot.sum(0).clamp_min(1.0).unsqueeze(1)  # (K,1)
+                    mean_pred = one_hot.T @ u / w  # (K,N)
+                    mean_real = one_hot.T @ x[:, :self.num_out] / w
+                    catnum += F.mse_loss(mean_pred, mean_real)
 
                 catnum = catnum / len(self.cat_sizes)
 
-                # group variances
-                var_loss = torch.tensor(0.0, device=DEVICE)
+                # ---------- NEW: per-category variances ----------
+                var_loss = 0.0
                 col_off = 0
-                x_num = x[:, :self.num_out]  # (B, N)
-                u_num = u  # (B, N)
                 for i, k in enumerate(self.cat_sizes):
-                    real_1h = x[:, self.num_out + col_off: self.num_out + col_off + k]  # (B, K)
-                    pred_1h = F.softmax(logits[i], 1)  # (B, K)
+                    one_hot = cond_mix[:, col_off: col_off + k]          # (B,K)
                     col_off += k
 
-                    # 1) expand to (B, N, K) so that we can do mask * value²
-                    real_mask = real_1h.unsqueeze(1)  # (B, 1, K)
-                    pred_mask = pred_1h.unsqueeze(1)  # (B, 1, K)
-                    x_sq = x_num.unsqueeze(2) ** 2  # (B, N, 1)
-                    u_sq = u_num.unsqueeze(2) ** 2  # (B, N, 1)
+                    w = one_hot.sum(0).clamp_min(1.0).unsqueeze(1)       # (K,1)
 
-                    # 2) sum over batch → (N, K)
-                    sq_real = (real_mask * x_sq).sum(0)
-                    sq_pred = (pred_mask * u_sq).sum(0)
+                    mean_pred = (one_hot.T @ u) / w                      # (K,N)
+                    mean_real = (one_hot.T @ x[:, :self.num_out]) / w
 
-                    # 3) divide by counts (1, K) → (N, K)
-                    w_real = real_1h.sum(0).clamp_min(1.0).unsqueeze(0)
-                    w_pred = pred_1h.sum(0).clamp_min(1.0).unsqueeze(0)
-                    var_real_nk = sq_real / w_real  # (N, K)
-                    var_pred_nk = sq_pred / w_pred  # (N, K)
+                    var_pred = (one_hot.T @ (u ** 2)) / w - mean_pred ** 2
+                    var_real = (one_hot.T @ (x[:, :self.num_out] ** 2)) / w - mean_real ** 2
 
-                    # 4) transpose → (K, N) to match your m_real shape
-                    var_real = var_real_nk.T
-                    var_pred = var_pred_nk.T
-
-                    var_loss += F.mse_loss(var_pred, var_real, reduction='mean')
+                    var_loss += F.mse_loss(var_pred, var_real)
 
                 var_loss = var_loss / len(self.cat_sizes)
 
-                # Pearson-cov for numeric↔numeric (keeps shape)
+
+                # keep original num-num & cat-cat regularisers
                 corr = self.cfg.corr_weight * F.mse_loss(
                     torch.corrcoef(x[:, :self.num_out].T),
-                    torch.corrcoef(u.T))
+                    torch.corrcoef(u.T),
+                )
 
-                # pairwise category one-hot covariance
-                catcat = 0.0
-                block = torch.cat([F.softmax(lg, 1) for lg in logits], 1)  # (B, ΣK)
-                target = x[:, self.num_out: self.num_out + self.cond_dim]  # real one-hots
-                catcat = F.mse_loss(torch.corrcoef(block.T), torch.corrcoef(target.T))
+                catcat = F.mse_loss(
+                    torch.corrcoef(cat_soft_blocks.T),
+                    torch.corrcoef(real_cond.T),
+                )
 
-                loss = rec + cat + kl + corr + self.cfg.catnum_weight * catnum + 0.5 * catcat + 0.1 * kl_cat + 0.5 * var_loss
-                self.opt.zero_grad(); loss.backward(); self.opt.step()
-                for k,v in zip(self.metrics,(rec,cat,kl,corr,loss)): sums[k]+=v.item()
-            for k in self.metrics: self.metrics[k].append(sums[k]/len(self.loader))
-            LOGGER.info("Ep %03d | Rec %.4f | Cat %.4f | KL %.4f | Corr %.4f | Tot %.4f",
-                        ep, *[self.metrics[k][-1] for k in ('rec','cat','kl','corr','total')])
+                # you can keep/adjust the weights as you wish
+                loss = (
+                        rec
+                        + cat
+                        + kl
+                        + corr
+                        + self.cfg.catnum_weight * catnum
+                        + 0.5 * catcat
+                        + 0.1 * kl_cat
+                        + 0.4 * var_loss
+                )
+
+                self.opt.zero_grad()
+                loss.backward()
+                self.opt.step()
+
+                for k, v in zip(self.metrics, (rec, cat, kl, corr, loss)):
+                    sums[k] += v.item()
+
+            for k in self.metrics:
+                self.metrics[k].append(sums[k] / len(self.loader))
+
+            LOGGER.info(
+                "Ep %03d | Rec %.4f | Cat %.4f | KL %.4f | Corr %.4f | Tot %.4f",
+                ep,
+                *[self.metrics[k][-1] for k in ("rec", "cat", "kl", "corr", "total")],
+            )
             self.sch.step()
         # plot
         ep_range = range(1, self.cfg.epochs+1)
@@ -306,33 +334,32 @@ class VAEPipeline:
             for start in range(0, n, bs):
                 cur = min(bs, n - start)
 
-                # 1) Sample raw numeric+cat in one go (sample() uses its internal τ schedule)
                 z = torch.randn(cur, self.cfg.latent_dim, device=DEVICE) * temperature
-                out1 = self.decoder.sample(z,
-                                           torch.zeros(cur, self.cond_dim, device=DEVICE),
-                                           hard=True)  # shape (cur, num_out+cond_dim)
-                num1 = out1[:, :self.num_out]  # (cur, num_out)
-                cond_pred = out1[:, self.num_out:]  # (cur, cond_dim)
 
-                # 2) Re-forward numeric head with the predicted one-hots
-                num2, _ = self.decoder.forward(z, cond_pred)  # (cur, num_out)
+                out1 = self.decoder.sample(
+                    z,
+                    torch.zeros(cur, self.cond_dim, device=DEVICE),
+                    hard=True)
 
-                # 3) Build final output matrix just like training data
+                num1 = out1[:, :self.num_out]
+                cond_pred = out1[:, self.num_out:]
+
+                num2, _ = self.decoder.forward(z, cond_pred)
+
                 dec_out = torch.cat([num2, cond_pred], dim=1).cpu().numpy()
                 rows.append(dec_out)
         mat=np.vstack(rows)[:n]
         data:Dict[str,List]= {}
         ptr=0
 
-        # ---- NUMERIC + DATETIME heads --------------------------------------
+        # numeric
         ptr = 0
         for c in self.num_cols + self.dt_cols:
-            raw = mat[:, ptr]  # decoder’s raw output for column c
+            raw = mat[:, ptr]
             ptr += 1
 
-            # 1) Standardise per batch → wide range
             z = (raw - raw.mean()) / (raw.std() + 1e-6)
-            u = scipy_stats_norm.cdf(z).clip(1e-6, 1 - 1e-6)  # avoid 0/1 edges
+            u = scipy_stats_norm.cdf(z).clip(1e-6, 1 - 1e-6)
 
             tf = self.tfs[c]
 

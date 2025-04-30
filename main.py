@@ -38,28 +38,24 @@ def main():
         # )
 
         # Configure GAN with optimal parameters for airline dataset
-        # gan_config = GanConfig(
-        #     epochs=10,
-        #     patience=320,
-        #     n_critic_initial=3,
-        #     gp_weight=2.5,
-        #     g_lr=1e-4,
-        #     d_lr=2e-4,
-        # )
-        #
-        # # Initialize and train GAN
-        # generator = GAN(real=real_data, meta=metadata, cfg=gan_config)
-        # # Train the model and get training metrics
-        # generator.fit(True)
-        # # Generate synthetic data using the best model
-        # synthetic_data = generator.generate(synthetic_size)
-        # logger.info(f"Generated synthetic data with shape: {synthetic_data.shape}")
+        gan_config = GanConfig(
+            epochs=320,
+            patience=10
+        )
 
-        vae_cfg = VAEConfig(epochs=100)
-        vae_pipe = VAEPipeline(df=real_data, meta=metadata_airline, cfg=vae_cfg)
-        vae_pipe.fit(True)
-        synthetic_data = vae_pipe.generate(30000)
+        # Initialize and train GAN
+        generator = GAN(real=real_data, meta=metadata, cfg=gan_config)
+        # Train the model and get training metrics
+        generator.fit(True)
+        # Generate synthetic data using the best model
+        synthetic_data = generator.generate(synthetic_size)
         logger.info(f"Generated synthetic data with shape: {synthetic_data.shape}")
+
+        # vae_cfg = VAEConfig(epochs=60)
+        # vae_pipe = VAEPipeline(df=real_data, meta=metadata_airline, cfg=vae_cfg)
+        # vae_pipe.fit(True)
+        # synthetic_data = vae_pipe.generate(30000)
+        # logger.info(f"Generated synthetic data with shape: {synthetic_data.shape}")
 
         generate_report(real_data, synthetic_data, metadata)
 

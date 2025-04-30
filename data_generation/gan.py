@@ -20,10 +20,10 @@ from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
 import seaborn as sns
 from matplotlib.ticker import MaxNLocator
-from data_generation.transformers import _BaseTf, _LogTf, _ZeroInflatedTf, _BoundedTf, _StdTf, _MinMaxTf, _ContTf, _DtTf
+from data_generation.transformers import _BaseTf, _LogTf, _ZeroInflatedTf, _StdTf, _MinMaxTf, _ContTf, _DtTf
 from models.enums import DataType
 from models.field_metadata import FieldMetadata
-
+from scipy.stats import norm as scipy_stats_norm
 
 from datetime import datetime
 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -34,6 +34,46 @@ LOGGER = logging.getLogger(__name__)
 LOGGER.addHandler(fh)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 amp_autocast = lambda: torch.amp.autocast("cuda", enabled=True)
+
+class _BoundedTf(_BaseTf):
+    """For variables with natural bounds like ages—now using quantile mapping."""
+
+    def fit(self, s: pd.Series) -> _BoundedTf:
+        # 1) Record min/max for safety (if you ever need it)
+        self.min_val = int(max(0, np.floor(s.min() / 5) * 5))
+        self.max_val = int(np.ceil(s.max() / 5) * 5)
+
+        # 2) Store the sorted real values for quantiles
+        self.sorted_ = np.sort(s.to_numpy(copy=True))
+        return self
+
+    def transform(self, s: pd.Series) -> np.ndarray:
+        # Exactly as before: clip into [min,max], scale to [-1,1]
+        s_clip = s.clip(self.min_val, self.max_val)
+        norm = (s_clip - self.min_val) / (self.max_val - self.min_val)
+        return 2 * norm - 1
+
+    def inverse(self, v: np.ndarray) -> pd.Series:
+        # 1) Clip into the window the model saw
+        v = np.clip(v, -1.0, 1.0)
+
+        # 2) Map back into [0,1]
+        u = (v + 1.0) / 2.0
+
+        # 3) Convert uniforms to empirical quantiles
+        #    idx floats in [0, len-1], then interpolate
+        n = len(self.sorted_)
+        idx = u * (n - 1)
+        lo = np.floor(idx).astype(int)
+        hi = np.minimum(lo + 1, n - 1)
+        frac = idx - lo
+
+        mapped = self.sorted_[lo] * (1 - frac) + self.sorted_[hi] * frac
+
+        # 4) Round to integer age
+        return pd.Series(np.round(mapped).astype(int))
+
+
 
 # ------------------------------------------------------------------#
 # CONFIG
@@ -401,10 +441,6 @@ class GAN:
         for c in self.num_cols:
             inv = self.tfs[c].inverse(mat[:, ptr])
             ptr += 1
-
-            # 1) invert any upstream log-transform
-            if getattr(self.meta[c], 'transformer', None) == 'log':
-                inv = np.expm1(inv)
 
             # 2) round to integer or fixed decimals
             m = self.meta[c]
