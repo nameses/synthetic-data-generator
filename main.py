@@ -3,7 +3,6 @@ import numpy as np
 from faker import Faker
 from typing import Dict, Optional
 import logging
-from data_generation.dataset_loader import DatasetLoader
 from data_generation.vae import VAEPipeline, VAEConfig
 from data_generation.gan import GAN,GanConfig
 
@@ -37,25 +36,25 @@ def main():
         #     metadata=metadata
         # )
 
-        # Configure GAN with optimal parameters for airline dataset
-        gan_config = GanConfig(
-            epochs=320,
-            patience=10
-        )
-
-        # Initialize and train GAN
-        generator = GAN(real=real_data, meta=metadata, cfg=gan_config)
-        # Train the model and get training metrics
-        generator.fit(True)
-        # Generate synthetic data using the best model
-        synthetic_data = generator.generate(synthetic_size)
-        logger.info(f"Generated synthetic data with shape: {synthetic_data.shape}")
-
-        # vae_cfg = VAEConfig(epochs=60)
-        # vae_pipe = VAEPipeline(df=real_data, meta=metadata_airline, cfg=vae_cfg)
-        # vae_pipe.fit(True)
-        # synthetic_data = vae_pipe.generate(30000)
+        # # Configure GAN with optimal parameters for airline dataset
+        # gan_config = GanConfig(
+        #     epochs=320,
+        #     patience=10
+        # )
+        #
+        # # Initialize and train GAN
+        # generator = GAN(real=real_data, meta=metadata, cfg=gan_config)
+        # # Train the model and get training metrics
+        # generator.fit(True)
+        # # Generate synthetic data using the best model
+        # synthetic_data = generator.generate(synthetic_size)
         # logger.info(f"Generated synthetic data with shape: {synthetic_data.shape}")
+
+        vae_cfg = VAEConfig(epochs=120)
+        vae_pipe = VAEPipeline(df=real_data, meta=metadata_airline, cfg=vae_cfg)
+        vae_pipe.fit(True)
+        synthetic_data = vae_pipe.generate(50000)
+        logger.info(f"Generated synthetic data with shape: {synthetic_data.shape}")
 
         generate_report(real_data, synthetic_data, metadata)
 

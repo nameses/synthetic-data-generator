@@ -9,9 +9,6 @@ class FieldMetadata:
             data_type: DataType,
             # numerical fields
             decimal_places: Optional[int] = None,
-            # range constraints (autofilled)
-            min_value: Optional[float] = None,
-            max_value: Optional[float] = None,
 
             # categorical/boolean fields
             #  - "uniform" → np.random.randint
@@ -36,5 +33,3 @@ class FieldMetadata:
         self.faker_args = faker_args or {}
 
         self.datetime_format = datetime_format
-
-        self.transformer = transformer
