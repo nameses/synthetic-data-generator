@@ -68,13 +68,11 @@ metadata_adult = {
 }
 
 metadata_power_consumption = {
-    'Date': FieldMetadata(DataType.DATETIME, datetime_format='%d/%m/%Y'),
-    'Time': FieldMetadata(DataType.DATETIME, datetime_format='%H:%M:%S'),
-    'Global_active_power': FieldMetadata(DataType.DECIMAL, decimal_places=3),
-    'Global_reactive_power': FieldMetadata(DataType.DECIMAL, decimal_places=3),
-    'Voltage': FieldMetadata(DataType.DECIMAL, decimal_places=3),
-    'Global_intensity': FieldMetadata(DataType.DECIMAL, decimal_places=3),
-    'Sub_metering_1': FieldMetadata(DataType.DECIMAL, decimal_places=3),
-    'Sub_metering_2': FieldMetadata(DataType.DECIMAL, decimal_places=3),
-    'Sub_metering_3': FieldMetadata(DataType.DECIMAL, decimal_places=3)
+    'Global_active_power': FieldMetadata(data_type=DataType.DECIMAL, decimal_places=3),
+    'Global_reactive_power': FieldMetadata(data_type=DataType.DECIMAL, decimal_places=3),
+    'Voltage': FieldMetadata(data_type=DataType.DECIMAL, decimal_places=2),
+    'Global_intensity': FieldMetadata(data_type=DataType.DECIMAL, decimal_places=1),
+    'Sub_metering_1': FieldMetadata(data_type=DataType.DECIMAL, decimal_places=1),
+    'Sub_metering_2': FieldMetadata(data_type=DataType.DECIMAL, decimal_places=1),
+    'Sub_metering_3': FieldMetadata(data_type=DataType.DECIMAL, decimal_places=1),
 }
