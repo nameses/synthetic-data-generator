@@ -13,7 +13,7 @@ class FieldMetadata:
             # categorical/boolean fields
             #  - "uniform" → np.random.randint
             #  - "empirical" → sample according to real data frequencies
-            sampling: Literal["uniform", "empirical"] = "uniform",
+            sampling: Literal["uniform", "empirical"] = "empirical",
 
             # string fields
             faker_method: Optional[Callable] = None,
@@ -21,8 +21,6 @@ class FieldMetadata:
 
             # datetime fields
             datetime_format: Optional[str] = None,
-
-            transformer: Optional[str] = None,
     ):
         self.data_type = data_type
         self.decimal_places = decimal_places

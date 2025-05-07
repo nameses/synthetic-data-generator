@@ -179,7 +179,11 @@ class VAE:
                 with torch.no_grad():
                     fake = self.generate(len(batch), temp=0.5, _cpu=False)['cont']
                 swd = sliced_wasserstein(fake, x[:,:self.num_dim])
-                corr_loss = F.l1_loss(batch_corr(fake), self.real_corr)
+                if fake.size(1) > 1:
+                    corr_mat = batch_corr(fake)
+                    corr_loss = F.l1_loss(corr_mat, self.real_corr)
+                else:
+                    corr_loss = torch.tensor(0.0, device=fake.device)
 
                 loss = loss_num + loss_cat + beta*kl + 5*swd + 10*corr_loss
                 self.opt.zero_grad(); loss.backward(); self.opt.step()
@@ -268,7 +272,8 @@ class VAE:
             m = self.meta[c]
             if m.faker_method is not None:
                 data[c] = [m.faker_method(**getattr(m,'faker_args',{})) for _ in range(n)]
-            else:                       # fall back to empirical sampling
+            else:
+                # fall back to empirical sampling
                 data[c] = self.real[c].sample(n, replace=True).to_list()
 
         df = pd.DataFrame(data)

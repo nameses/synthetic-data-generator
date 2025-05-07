@@ -35,49 +35,10 @@ LOGGER.addHandler(fh)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 amp_autocast = lambda: torch.amp.autocast("cuda", enabled=True)
 
-class _BoundedTf(_BaseTf):
-    """For variables with natural bounds like ages—now using quantile mapping."""
-
-    def fit(self, s: pd.Series) -> _BoundedTf:
-        # 1) Record min/max for safety (if you ever need it)
-        self.min_val = int(max(0, np.floor(s.min() / 5) * 5))
-        self.max_val = int(np.ceil(s.max() / 5) * 5)
-
-        # 2) Store the sorted real values for quantiles
-        self.sorted_ = np.sort(s.to_numpy(copy=True))
-        return self
-
-    def transform(self, s: pd.Series) -> np.ndarray:
-        # Exactly as before: clip into [min,max], scale to [-1,1]
-        s_clip = s.clip(self.min_val, self.max_val)
-        norm = (s_clip - self.min_val) / (self.max_val - self.min_val)
-        return 2 * norm - 1
-
-    def inverse(self, v: np.ndarray) -> pd.Series:
-        # 1) Clip into the window the model saw
-        v = np.clip(v, -1.0, 1.0)
-
-        # 2) Map back into [0,1]
-        u = (v + 1.0) / 2.0
-
-        # 3) Convert uniforms to empirical quantiles
-        #    idx floats in [0, len-1], then interpolate
-        n = len(self.sorted_)
-        idx = u * (n - 1)
-        lo = np.floor(idx).astype(int)
-        hi = np.minimum(lo + 1, n - 1)
-        frac = idx - lo
-
-        mapped = self.sorted_[lo] * (1 - frac) + self.sorted_[hi] * frac
-
-        # 4) Round to integer age
-        return pd.Series(np.round(mapped).astype(int))
-
-
-
-# ------------------------------------------------------------------#
-# CONFIG
-# ------------------------------------------------------------------#
+def _set_seed(s):
+    random.seed(s); np.random.seed(s); torch.manual_seed(s)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(s)
 
 
 @dataclass(slots=True)
@@ -93,18 +54,25 @@ class GanConfig:
     d_lr: float = 2e-4
     epochs: int = 500
     seed: int = 42
-    # cosine schedule
     lr_min_ratio: float = 0.05
-    # early stop
     patience: int = 320
-    # gumbel
     tau_start: float = 2.5
     tau_end: float = 0.25
     val_interval: int = 5
-    # visualization
-    plot_interval: int = 10
-    plot_samples: int = 1000
-    save_plots: bool = False
+
+    use_delta_loss: bool = False
+    delta_w: float = 5.0
+    delta_warmup: int = 100
+
+    use_bias_correction: bool = False
+
+    use_fm_loss: bool = False  # feature‐matching loss (2)
+    fm_w: float = 1.0  # … its weight
+
+    use_cov_loss: bool = False  # covariance matching loss (5)
+    cov_w: float = 1.0  # … its weight
+
+    use_hinge: bool = False  # hinge (soft) GAN losses (3)
 
 
 def lin_sn(i, o): return spectral_norm(nn.Linear(i, o))
@@ -135,6 +103,12 @@ class _Generator(nn.Module):
         self.num_head = nn.Linear(hid, num_out) if num_out else None
         self.cat_heads = nn.ModuleList(nn.Linear(hid, k) for k in cat_dims)
 
+        if num_out and cfg.use_bias_correction:
+            self.register_parameter("bias", nn.Parameter(torch.zeros(num_out)))
+            self.register_parameter("scale", nn.Parameter(torch.ones(num_out)))
+        else:
+            self.bias = self.scale = None
+
     def forward(self, z, cond_vec, hard=False):
         h = self.backbone(torch.cat([z, cond_vec], 1))
         out = [self.num_head(h)] if self.num_head else []
@@ -145,7 +119,13 @@ class _Generator(nn.Module):
         for head in self.cat_heads:
             out.append(F.gumbel_softmax(head(h), tau=tau, hard=hard))
         self.step += 1
-        return torch.cat(out, 1)
+
+        y = torch.cat(out, 1)
+        if self.bias is not None:
+            k = self.num_head.out_features
+            cont = y[:, :k] * self.scale + self.bias  # new tensor
+            y = torch.cat([cont, y[:, k:]], 1)  # no in-place write
+        return y
 
 
 class _Discriminator(nn.Module):
@@ -164,10 +144,11 @@ class _Discriminator(nn.Module):
 
     def forward(self, x, c): return self.net(torch.cat([x, c], 1)).view(-1)
 
-
-# ------------------------------------------------------------------#
-# MAIN DRIVER
-# ------------------------------------------------------------------#
+    def feature_map(self, x, c):
+        """Return penultimate activations for feature‐matching."""
+        # apply all but the last linear:
+        h = self.net[:-1](torch.cat([x, c], 1))
+        return h
 
 
 class GAN:
@@ -177,8 +158,8 @@ class GAN:
 
         self.real_df = real.dropna().reset_index(drop=True)
 
-        self.W_smooth = None  # running abs Wasserstein
-        self.n_critic = 5  # start conservatively
+        self.W_smooth = None
+        self.n_critic = 5
         
         # Initialize training metrics
         self.metrics = {
@@ -189,10 +170,9 @@ class GAN:
             'n_critic': [],
             'lr_d': [],
             'lr_g': [],
-            'val_wd': {},  # To store validation Wasserstein distances per feature
+            'val_wd': {},
         }
 
-        # ------------ column groups & transformers --------------
         self.num_cols, self.dt_cols, self.cat_cols, self.str_cols = [], [], [], []
         for c, m in meta.items():
             if m.data_type in {DataType.INTEGER, DataType.DECIMAL}:
@@ -207,44 +187,37 @@ class GAN:
         self.tfs: Dict[str, _BaseTf] = {}; mats = []
 
         for c in self.num_cols:
-            mode = getattr(self.meta[c], "transformer", None)
-            if mode == "standard":
-                tf = _StdTf().fit(real[c])
-            elif mode == "minmax":
-                tf = _MinMaxTf().fit(real[c])
-            elif mode == "log":
-                tf = _LogTf().fit(real[c])
-            elif mode == "zero_inflated":
-                tf = _ZeroInflatedTf().fit(real[c])
-            elif mode == "bounded":
-                tf = _BoundedTf().fit(real[c])
-            else:  # default rank‑Gauss
-                tf = _ContTf().fit(real[c])
+            tf = _ContTf().fit(real[c])
             self.tfs[c] = tf
             mats.append(tf.transform(real[c]))
 
         for c in self.dt_cols:
-            tf = _DtTf(meta[c].datetime_format).fit(real[c]); self.tfs[c] = tf; mats.append(tf.transform(real[c]))
+            tf = _DtTf(meta[c].datetime_format).fit(real[c])
+            self.tfs[c] = tf
+            mats.append(tf.transform(real[c]))
 
         self.cat_sizes, self.cat_maps = [], {}
         for c in self.cat_cols:
             uniq = sorted(real[c].astype(str).unique())
             self.cat_sizes.append(len(uniq))
             mp = {v: i for i, v in enumerate(uniq)}; self.cat_maps[c] = mp
-            mats.append(F.one_hot(torch.tensor(real[c].astype(str).map(mp).values),
-                                  num_classes=len(uniq)).T.numpy())
+            mats.append(F.one_hot(torch.tensor(real[c].astype(str).map(mp).values), num_classes=len(uniq)).T.numpy())
 
-        # --- compute per-col sampling probs for any cat flagged 'empirical' ---
         self.cat_probs: dict[str, np.ndarray] = {}
         for c, size in zip(self.cat_cols, self.cat_sizes):
-            m = meta[c]
-            if m.sampling == "empirical":
-                # map real values → integer indices
-                inv = real[c].astype(str).map(self.cat_maps[c])
-                counts = inv.value_counts().sort_index()
-                self.cat_probs[c] = (counts / counts.sum()).values
+            # empirical sampling
+            inv = real[c].astype(str).map(self.cat_maps[c])
+            counts = inv.value_counts().sort_index()
+            self.cat_probs[c] = (counts / counts.sum()).values
 
         X = torch.tensor(np.vstack(mats).T, dtype=torch.float32)
+
+        if cfg.use_delta_loss and (self.num_cols or self.dt_cols):
+            cont_real = X[:, : (len(self.num_cols) + len(self.dt_cols))].cpu().numpy()
+            self.delta_real = torch.tensor(np.diff(cont_real, axis=0), dtype=torch.float32).to(DEVICE)
+        else:
+            self.delta_real = None
+
         self.loader = DataLoader(TensorDataset(X), cfg.batch_size, shuffle=True, drop_last=True)
         LOGGER.info("Real tensor %s", X.shape)
 
@@ -320,7 +293,7 @@ class GAN:
     
                 # train G every n_critic steps
                 if i % self.n_critic == 0:
-                    g_loss = self._train_g(real_batch.size(0), cond)
+                    g_loss = self._train_g(real_batch, cond, epoch)
                     g_sum += g_loss.item()
     
             # adapt n_critic, decay LRs, EMA‑stop as before…
@@ -404,17 +377,6 @@ class GAN:
 
     # ------------------------------------------------------------------#
     def generate(self, n: int, use_best_model=False, temperature=1.0) -> pd.DataFrame:
-        """
-        Generate synthetic data.
-        
-        Parameters:
-            n: Number of samples to generate
-            use_best_model: Whether to use the best model saved during training
-            temperature: Temperature for sampling (higher = more diversity)
-        
-        Returns:
-            DataFrame with synthetic data
-        """
         # Use best model if available and requested
         if use_best_model and hasattr(self, 'best_state'):
             orig_state = copy.deepcopy(self.G.state_dict())
@@ -423,13 +385,23 @@ class GAN:
         
         self.ema_G.eval()
         rows, bs = [], self.cfg.batch_size
+
+        if isinstance(temperature, (list, tuple, np.ndarray)):
+            temp_vec = torch.tensor(temperature, device=DEVICE).float()
+            assert len(temp_vec) == len(self.num_cols) + len(self.dt_cols), "temperature list length mismatch"
+        else:
+            temp_vec = None
+
         with torch.no_grad():
             for _ in range(0, n, bs):
                 cur = min(bs, n - len(rows))
                 # Apply temperature to noise distribution
-                z = torch.randn(cur, self.cfg.latent_dim, device=DEVICE) * temperature
+                z = torch.randn(cur, self.cfg.latent_dim, device=DEVICE) * (temperature if not temp_vec else 1.0)
                 cond = self._sample_cond(cur).to(DEVICE)
-                rows.append(self.ema_G(z, cond, hard=True).cpu().numpy())
+                out = self.ema_G(z, cond, hard=True)
+                if temp_vec is not None:
+                    out[:, :len(temp_vec)] *= temp_vec
+                rows.append(out.cpu().numpy())
         mat = np.vstack(rows)[:n]
         
         # Restore original model if we switched
@@ -442,11 +414,11 @@ class GAN:
             inv = self.tfs[c].inverse(mat[:, ptr])
             ptr += 1
 
-            # 2) round to integer or fixed decimals
+            # round to integer or fixed decimals
             m = self.meta[c]
             if m.data_type is DataType.INTEGER:
                 inv = np.round(inv).astype(int)
-            else:  # DECIMAL
+            else:
                 inv = np.round(inv, m.decimal_places)
 
             data[c] = inv
@@ -464,9 +436,6 @@ class GAN:
         df = pd.DataFrame(data)
         return df[list(self.meta.keys())]
 
-    # ------------------------------------------------------------------#
-    # TRAIN HELPERS
-    # ------------------------------------------------------------------#
     def _train_d(self, real, cond):
         self.opt_d.zero_grad(set_to_none=True)
         z = torch.randn(real.size(0), self.cfg.latent_dim, device=DEVICE)
@@ -474,23 +443,67 @@ class GAN:
         with amp_autocast():
             d_real = self.D(real, cond)
             d_fake = self.D(fake, cond)
-            gp = self._gp(real, fake, cond)
-
-            # Wasserstein estimate & full loss
+            # always compute W‐dist estimate for logging
             w_est = d_real.mean() - d_fake.mean()
-            loss = -w_est + self.cfg.gp_weight * gp
-            loss += self.cfg.drift_epsilon * (d_real.pow(2).mean() + d_fake.pow(2).mean())
+
+            if self.cfg.use_hinge:
+                loss = F.relu(1.0 - d_real).mean() + F.relu(1.0 + d_fake).mean()
+            else:
+                gp = self._gp(real, fake, cond)
+                loss = -w_est + self.cfg.gp_weight * gp
+                loss = loss + self.cfg.drift_epsilon * (
+                        d_real.pow(2).mean() + d_fake.pow(2).mean()
+                )
 
         self.scaler_d.scale(loss).backward()
         self.scaler_d.step(self.opt_d)
         self.scaler_d.update()
         return w_est.item(), loss.item()
 
-    def _train_g(self, bsz, cond):
+    def _train_g(self, real, cond, epoch):
+        bsz = real.size(0)
         self.opt_g.zero_grad(set_to_none=True)
         z = torch.randn(bsz, self.cfg.latent_dim, device=DEVICE)
         with amp_autocast():
-            loss = -self.D(self.G(z, cond), cond).mean()
+            fake = self.G(z, cond)
+            loss_adv = -self.D(fake, cond).mean()
+
+            # optional Δ-loss
+            if self.cfg.use_delta_loss and self.delta_real is not None:
+                fake_cont = fake[:, : (len(self.num_cols) + len(self.dt_cols))]
+                delta_fake = fake_cont[1:] - fake_cont[:-1]
+                # EM distance between distributions (one-sample approx.)
+                loss_delta = F.mse_loss(
+                    delta_fake.mean(0), self.delta_real.mean(0)
+                )
+                current_w = self.cfg.delta_w * min(1, epoch / self.cfg.delta_warmup)
+                loss = loss_adv + current_w * loss_delta
+            else:
+                loss = loss_adv
+
+            if self.cfg.use_fm_loss:
+                #  ── feature‐matching
+                fr = self.D.feature_map(real, cond)
+                ff = self.D.feature_map(fake, cond)
+                fm = F.mse_loss(ff.mean(0), fr.mean(0))
+                loss = loss + self.cfg.fm_w * fm
+
+            if self.cfg.use_cov_loss:
+                # select only the continuous columns
+                cont_fake = fake[:, : len(self.num_cols)]
+                cont_real = real[:, : len(self.num_cols)]
+
+                # center each feature
+                f_centered = cont_fake - cont_fake.mean(dim=0, keepdim=True)
+                r_centered = cont_real - cont_real.mean(dim=0, keepdim=True)
+
+                # covariance = (Xᵀ X) / (N - 1)
+                cov_f = (f_centered.T @ f_centered) / (cont_fake.size(0) - 1)
+                cov_r = (r_centered.T @ r_centered) / (cont_real.size(0) - 1)
+
+                # detach real‐cov so gradient flows only through cov_f
+                cov_loss = F.mse_loss(cov_f, cov_r.detach())
+                loss += self.cfg.cov_w * cov_loss
         self.scaler_g.scale(loss).backward()
         self.scaler_g.step(self.opt_g)
         self.scaler_g.update()
@@ -500,7 +513,6 @@ class GAN:
                 p_ema.mul_(self.ema_beta).add_(p.data, alpha=1 - self.ema_beta)
         return loss
 
-    # ------------------------------------------------------------------#
     def _sample_cond(self, bsz):
         if not self.cat_cols:
             return torch.zeros(bsz, 0, device=DEVICE)
@@ -588,33 +600,5 @@ class GAN:
         plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
         
         plt.tight_layout()
-        
-        # Save if configured
-        # if self.cfg.save_plots:
-        #    plt.savefig(f'gan_training_metrics_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png', dpi=300)
-            
+
         plt.show()
-
-
-def _set_seed(s):
-    random.seed(s); np.random.seed(s); torch.manual_seed(s)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(s)
-
-def visualize_gan_training(gan_model):
-    """
-    Visualize GAN training metrics and generated data.
-    
-    Parameters:
-        gan_model: Trained GAN model
-    """
-    # Plot overall training metrics
-    gan_model.plot_training_metrics()
-    
-    # Generate synthetic data and plot distributions
-    synthetic_data = gan_model.generate(gan_model.cfg.plot_samples)
-    gan_model.plot_distributions(synthetic_data)
-    
-    # Plot correlation matrices
-    if len(gan_model.num_cols) >= 2:
-        gan_model.plot_correlation_matrix(synthetic_data)
