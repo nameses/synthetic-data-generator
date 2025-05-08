@@ -1,8 +1,11 @@
-# Package initialization for data generation
+"""
+data_generation package: provides modules for synthetic data generation
+including variational autoencoder (VAE), generative adversarial network (GAN),
+and data transformers.
+"""
 
-# Import modules in this package
+
 from . import vae
-from . import gan
 from . import transformers
 
 __all__ = ["gan", "vae", "transformers"]

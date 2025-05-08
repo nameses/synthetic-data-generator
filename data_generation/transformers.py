@@ -1,3 +1,14 @@
+"""
+transformers.py
+
+Defines data transformation classes for preprocessing and postprocessing of features
+in synthetic data pipelines. Each transformer implements fit/transform/inverse_transform:
+
+- _ContTf: continuous (numeric) scaling and normalization.
+- _DtTf: encodes datetime fields into numeric cyclic features or ordinal form.
+"""
+
+
 from __future__ import annotations
 import numpy as np
 import pandas as pd

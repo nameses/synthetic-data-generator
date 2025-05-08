@@ -1,3 +1,15 @@
+"""
+vae.py
+
+Implements a Variational Autoencoder (VAE) for learning latent representations of tabular data
+and generating synthetic samples. Includes model definition, training loop, and data handling:
+
+- VAE: encoder–decoder network with configurable latent dimension.
+- Loss components: reconstruction loss (numeric & categorical), KL divergence, correlation penalty.
+- Data pipeline: apply continuous transformers, one‐hot encode categoricals, and batch sampling.
+- Utilities: model checkpointing, sample generation, and training progress logging.
+"""
+
 import logging
 import math, random, itertools, torch, torch.nn as nn, torch.nn.functional as functional
 from dataclasses import dataclass
