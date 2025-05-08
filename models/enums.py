@@ -1,10 +1,14 @@
+"""Python module to define enumerations for various data types."""
+
 from enum import Enum
 
 
 class DataType(Enum):
-    Integer = "int"
-    Decimal = "decimal"
-    String = "string"
-    Boolean = "boolean"
-    Categorical = "categorical"
-    Datetime = "datetime"
+    """Enumeration for different data types."""
+
+    INTEGER = "int"
+    DECIMAL = "decimal"
+    STRING = "string"
+    BOOLEAN = "boolean"
+    CATEGORICAL = "categorical"
+    DATETIME = "datetime"

@@ -1,24 +1,26 @@
-from typing import Optional, Callable, Dict, Literal
+"""Field metadata for data generation."""
+
+from dataclasses import dataclass, field
+from typing import Optional, Callable, Dict
 
 from models.enums import DataType
 
 
+@dataclass(slots=True)
 class FieldMetadata:
-    def __init__(
-        self,
-        data_type: DataType,
-        # numerical fields
-        decimal_places: Optional[int] = None,
-        # string fields
-        faker_method: Optional[Callable] = None,
-        faker_args: Optional[Dict] = None,
-        # datetime fields
-        datetime_format: Optional[str] = None,
-    ):
-        self.data_type = data_type
-        self.decimal_places = decimal_places
+    """Metadata for a field in the dataset."""
 
-        self.faker_method = faker_method
-        self.faker_args = faker_args or {}
+    data_type: DataType
+    """The type of data (e.g., Integer, Float, String, DateTime)."""
 
-        self.datetime_format = datetime_format
+    decimal_places: Optional[int] = None
+    """For numeric fields: number of decimal places (if Float)."""
+
+    faker_method: Optional[Callable] = None
+    """For string fields: Faker method to generate data."""
+
+    faker_args: Dict = field(default_factory=dict)
+    """Arguments to pass to the Faker method."""
+
+    datetime_format: Optional[str] = None
+    """For DateTime fields: Python datetime format string."""

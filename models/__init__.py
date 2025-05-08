@@ -1,4 +1,4 @@
-# Package initialization for models
+"""Initialization file for the models module."""
 
 from . import enums
 from . import field_metadata
