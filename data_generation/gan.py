@@ -4,28 +4,31 @@ import copy
 import logging
 import math
 import random
-from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Callable, Dict, List
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as functional
 from faker import Faker
-from scipy.stats import norm, rankdata, wasserstein_distance
+from scipy.stats import wasserstein_distance
 from sklearn.model_selection import train_test_split
 from torch.nn.utils import spectral_norm
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
-import seaborn as sns
 from matplotlib.ticker import MaxNLocator
-from data_generation.transformers import _BaseTf, _LogTf, _ZeroInflatedTf, _StdTf, _MinMaxTf, _ContTf, _DtTf
+from data_generation.transformers import (
+    _BaseTf,
+    _ContTf,
+    _DtTf,
+)
 from models.enums import DataType
 from models.field_metadata import FieldMetadata
-from scipy.stats import norm as scipy_stats_norm
 
 from datetime import datetime
+
 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 fh = logging.FileHandler(f"train_{ts}.log", mode="w", encoding="utf‑8")
 fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
@@ -35,10 +38,34 @@ LOGGER.addHandler(fh)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 amp_autocast = lambda: torch.amp.autocast("cuda", enabled=True)
 
-def _set_seed(s):
-    random.seed(s); np.random.seed(s); torch.manual_seed(s)
+
+def set_seed(seed: int = 42) -> None:
+    """Set *all* library RNGs for reproducibility.
+
+    Args:
+        seed: Arbitrary integer used to seed *random*, *NumPy* and *PyTorch*
+            (CPU & CUDA) generators.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(s)
+        torch.cuda.manual_seed_all(seed)
+
+
+def lin_sn(inp: int, out: int) -> nn.Linear:
+    """Return a spectrally‑normalized ``nn.Linear`` layer."""
+    return spectral_norm(nn.Linear(inp, out))
+
+
+class MinibatchStd(nn.Module):
+    """Append per‑batch standard deviation as an additional feature column."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Compute std across batch for every feature, then average → scalar
+        std = x.std(0, keepdim=True).mean().expand(x.size(0), 1)
+        # Concatenate scalar std to every sample
+        return torch.cat([x, std], dim=1)
 
 
 @dataclass(slots=True)
@@ -63,34 +90,32 @@ class GanConfig:
     use_delta_loss: bool = False
     delta_w: float = 5.0
     delta_warmup: int = 100
-
     use_bias_correction: bool = False
-
     use_fm_loss: bool = False  # feature‐matching loss (2)
     fm_w: float = 1.0  # … its weight
-
     use_cov_loss: bool = False  # covariance matching loss (5)
     cov_w: float = 1.0  # … its weight
-
     use_hinge: bool = False  # hinge (soft) GAN losses (3)
 
 
-def lin_sn(i, o): return spectral_norm(nn.Linear(i, o))
-
-
-class MinibatchStd(nn.Module):
-    def forward(self, x):
-        std = x.std(0, keepdim=True).mean().expand(x.size(0), 1)
-        return torch.cat([x, std], 1)
-
-
 class _Generator(nn.Module):
-    def __init__(self, cfg: GanConfig, num_out: int, cat_dims: List[int], total_steps: int):
+    """Conditional generator that supports numeric and categorical outputs."""
+
+    def __init__(
+        self,
+        cfg: GanConfig,
+        num_out: int,
+        cat_dims: List[int],
+        total_steps: int,
+    ) -> None:
         super().__init__()
-        self.cfg, self.total_steps = cfg, total_steps
+
+        self.cfg = cfg
+        self.total_steps = total_steps
         self.register_buffer("step", torch.zeros(1))
 
         hid = cfg.hidden_g
+        # Backbone comprises 3 fully‑connected layers + MinibatchStd
         self.backbone = nn.Sequential(
             nn.Linear(cfg.latent_dim + sum(cat_dims), hid),
             nn.LeakyReLU(0.2),
@@ -100,36 +125,60 @@ class _Generator(nn.Module):
             nn.Linear(hid + 1, hid),
             nn.LeakyReLU(0.2),
         )
+
+        # Output heads
         self.num_head = nn.Linear(hid, num_out) if num_out else None
         self.cat_heads = nn.ModuleList(nn.Linear(hid, k) for k in cat_dims)
 
+        # Optional bias/scale correction for continuous variables
         if num_out and cfg.use_bias_correction:
             self.register_parameter("bias", nn.Parameter(torch.zeros(num_out)))
             self.register_parameter("scale", nn.Parameter(torch.ones(num_out)))
         else:
             self.bias = self.scale = None
 
-    def forward(self, z, cond_vec, hard=False):
+    def forward(
+        self, z: torch.Tensor, cond_vec: torch.Tensor, hard: bool = False
+    ) -> torch.Tensor:
+        """Forward pass. Generate a synthetic batch
+
+        Args:
+            z: Latent noise of shape [batch, latent_dim].
+            cond_vec: Optional conditional vector (labels) concatenated to *z*
+            hard: If True, return hard categorical samples (one‑hot) instead of gumbel‑softmax probabilities.
+        """
         h = self.backbone(torch.cat([z, cond_vec], 1))
-        out = [self.num_head(h)] if self.num_head else []
-        # cosine‑annealed Gumbel τ
+
+        out: List[torch.Tensor] = []
+        if self.num_head is not None:
+            out.append(self.num_head(h))
+
+        # Cosine‑annealed Gumbel temperature
         tau = self.cfg.tau_end + 0.5 * (self.cfg.tau_start - self.cfg.tau_end) * (
             1 + math.cos(math.pi * self.step.item() / self.total_steps)
         )
+
         for head in self.cat_heads:
-            out.append(F.gumbel_softmax(head(h), tau=tau, hard=hard))
+            logits = head(h)
+            out.append(functional.gumbel_softmax(logits, tau=tau, hard=hard))
+
+        # Increase global step counter
         self.step += 1
 
         y = torch.cat(out, 1)
+
+        # Affine post‑hoc correction for continuous outputs if enabled
         if self.bias is not None:
-            k = self.num_head.out_features
-            cont = y[:, :k] * self.scale + self.bias  # new tensor
-            y = torch.cat([cont, y[:, k:]], 1)  # no in-place write
+            k = self.num_head.out_features  # number of numeric columns
+            cont = y[:, :k] * self.scale + self.bias
+            y = torch.cat([cont, y[:, k:]], 1)
         return y
 
 
 class _Discriminator(nn.Module):
-    def __init__(self, inp_dim, cond_dim, cfg: GanConfig):
+    """MLP discriminator with spectral normalization on each layer."""
+
+    def __init__(self, inp_dim: int, cond_dim: int, cfg: GanConfig):
         super().__init__()
         hid = cfg.hidden_d
         self.net = nn.Sequential(
@@ -142,49 +191,57 @@ class _Discriminator(nn.Module):
             lin_sn(hid // 2, 1),
         )
 
-    def forward(self, x, c): return self.net(torch.cat([x, c], 1)).view(-1)
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """Return real/fake logits for batch *(x, c)*."""
+        return self.net(torch.cat([x, c], 1)).view(-1)
 
-    def feature_map(self, x, c):
-        """Return penultimate activations for feature‐matching."""
-        # apply all but the last linear:
-        h = self.net[:-1](torch.cat([x, c], 1))
-        return h
+    @torch.no_grad()
+    def feature_map(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """Return activations before the last linear layer (feature matching)"""
+        return self.net[:-1](torch.cat([x, c], dim=1))
 
 
 class GAN:
-    def __init__(self, real: pd.DataFrame, meta: Dict[str, FieldMetadata], cfg: GanConfig):
+    def __init__(
+        self, real: pd.DataFrame, meta: Dict[str, FieldMetadata], cfg: GanConfig
+    ):
         self.cfg, self.meta, self.faker = cfg, meta, Faker()
-        _set_seed(cfg.seed)
+        set_seed(cfg.seed)
 
+        # Real data frame
         self.real_df = real.dropna().reset_index(drop=True)
 
         self.W_smooth = None
+        # Number of generator updates per discriminator update
         self.n_critic = 5
-        
+
         # Initialize training metrics
         self.metrics = {
-            'epochs': [],
-            'w_distance': [],
-            'd_loss': [],
-            'g_loss': [],
-            'n_critic': [],
-            'lr_d': [],
-            'lr_g': [],
-            'val_wd': {},
+            "epochs": [],
+            "w_distance": [],
+            "d_loss": [],
+            "g_loss": [],
+            "n_critic": [],
+            "lr_d": [],
+            "lr_g": [],
+            "val_wd": {},
         }
 
-        self.num_cols, self.dt_cols, self.cat_cols, self.str_cols = [], [], [], []
-        for c, m in meta.items():
-            if m.data_type in {DataType.INTEGER, DataType.DECIMAL}:
-                self.num_cols.append(c)
-            elif m.data_type is DataType.DATETIME:
-                self.dt_cols.append(c)
-            elif m.data_type in {DataType.CATEGORICAL, DataType.BOOLEAN}:
-                self.cat_cols.append(c)
-            elif m.data_type is DataType.STRING:
-                self.str_cols.append(c)
+        self.num_cols = [
+            c
+            for c, m in meta.items()
+            if m.data_type in {DataType.Integer, DataType.Decimal}
+        ]
+        self.dt_cols = [c for c, m in meta.items() if m.data_type == DataType.Datetime]
+        self.cat_cols = [
+            c
+            for c, m in meta.items()
+            if m.data_type in {DataType.Categorical, DataType.Boolean}
+        ]
+        self.str_cols = [c for c, m in meta.items() if m.data_type == DataType.String]
 
-        self.tfs: Dict[str, _BaseTf] = {}; mats = []
+        self.tfs: Dict[str, _BaseTf] = {}
+        mats = []
 
         for c in self.num_cols:
             tf = _ContTf().fit(real[c])
@@ -196,12 +253,19 @@ class GAN:
             self.tfs[c] = tf
             mats.append(tf.transform(real[c]))
 
-        self.cat_sizes, self.cat_maps = [], {}
+        self.cat_sizes = []
+        self.cat_maps = {}
         for c in self.cat_cols:
             uniq = sorted(real[c].astype(str).unique())
             self.cat_sizes.append(len(uniq))
-            mp = {v: i for i, v in enumerate(uniq)}; self.cat_maps[c] = mp
-            mats.append(F.one_hot(torch.tensor(real[c].astype(str).map(mp).values), num_classes=len(uniq)).T.numpy())
+            mp = {v: i for i, v in enumerate(uniq)}
+            self.cat_maps[c] = mp
+            mats.append(
+                functional.one_hot(
+                    torch.tensor(real[c].astype(str).map(mp).values),
+                    num_classes=len(uniq),
+                ).T.numpy()
+            )
 
         self.cat_probs: dict[str, np.ndarray] = {}
         for c, size in zip(self.cat_cols, self.cat_sizes):
@@ -214,24 +278,38 @@ class GAN:
 
         if cfg.use_delta_loss and (self.num_cols or self.dt_cols):
             cont_real = X[:, : (len(self.num_cols) + len(self.dt_cols))].cpu().numpy()
-            self.delta_real = torch.tensor(np.diff(cont_real, axis=0), dtype=torch.float32).to(DEVICE)
+            self.delta_real = torch.tensor(
+                np.diff(cont_real, axis=0), dtype=torch.float32
+            ).to(DEVICE)
         else:
             self.delta_real = None
 
-        self.loader = DataLoader(TensorDataset(X), cfg.batch_size, shuffle=True, drop_last=True)
+        self.loader = DataLoader(
+            TensorDataset(X), cfg.batch_size, shuffle=True, drop_last=True
+        )
         LOGGER.info("Real tensor %s", X.shape)
 
         steps_per_epoch = math.ceil(len(self.loader))
         total_steps = cfg.epochs * steps_per_epoch
         cond_dim = sum(self.cat_sizes)
 
-        self.G = _Generator(cfg, len(self.num_cols) + len(self.dt_cols), self.cat_sizes, total_steps).to(DEVICE)
+        self.G = _Generator(
+            cfg, len(self.num_cols) + len(self.dt_cols), self.cat_sizes, total_steps
+        ).to(DEVICE)
         self.D = _Discriminator(X.shape[1], cond_dim, cfg).to(DEVICE)
 
-        self.opt_g = torch.optim.Adam(self.G.parameters(), lr=cfg.g_lr, betas=(0.0, 0.9))
-        self.opt_d = torch.optim.Adam(self.D.parameters(), lr=cfg.d_lr, betas=(0.0, 0.9))
-        self.sch_g = CosineAnnealingLR(self.opt_g, cfg.epochs, eta_min=cfg.g_lr * cfg.lr_min_ratio)
-        self.sch_d = CosineAnnealingLR(self.opt_d, cfg.epochs, eta_min=cfg.d_lr * cfg.lr_min_ratio)
+        self.opt_g = torch.optim.Adam(
+            self.G.parameters(), lr=cfg.g_lr, betas=(0.0, 0.9)
+        )
+        self.opt_d = torch.optim.Adam(
+            self.D.parameters(), lr=cfg.d_lr, betas=(0.0, 0.9)
+        )
+        self.sch_g = CosineAnnealingLR(
+            self.opt_g, cfg.epochs, eta_min=cfg.g_lr * cfg.lr_min_ratio
+        )
+        self.sch_d = CosineAnnealingLR(
+            self.opt_d, cfg.epochs, eta_min=cfg.d_lr * cfg.lr_min_ratio
+        )
 
         self.scaler_g = torch.amp.GradScaler("cuda", enabled=True)
         self.scaler_d = torch.amp.GradScaler("cuda", enabled=True)
@@ -240,123 +318,137 @@ class GAN:
         self.ema_beta, self.best_w, self.no_imp = 0.999, -float("inf"), 0
         self.n_critic = cfg.n_critic_initial
 
+        # Set for validation WD testing. Defined in fit method
+        self.val_df = None
+        # Wasserstein distance for early stopping
+        self.w_ema = None
+        # Best model state for early stopping
+        self.best_state = None
+
     # ------------------------------------------------------------------#
     def fit(self, verbose=False):
-        # ── 0) split the full real→tensor dataset into train/val ───────────────
-        #    we already built self.loader.dataset.tensors[0] as X_all
-        X_all = self.loader.dataset.tensors[0]  # torch.Tensor [N, features]
+        dataset: TensorDataset = self.loader.dataset
+        X_all = dataset.tensors[0]
         N = X_all.size(0)
         idx = np.arange(N)
-        train_idx, val_idx = train_test_split(idx, test_size=0.2, random_state=self.cfg.seed)
-    
-        # rebuild a loader that only yields the TRAIN split
+        train_idx, val_idx = train_test_split(
+            idx, test_size=0.2, random_state=self.cfg.seed
+        )
+
+        # rebuild a loader that only yields the train split
         X_train = X_all[train_idx]
         self.loader = DataLoader(
             TensorDataset(X_train),
             batch_size=self.cfg.batch_size,
             shuffle=True,
-            drop_last=True
+            drop_last=True,
         )
-    
+
         # keep a pandas hold‑out for validation WD
         self.val_df = self.real_df.iloc[val_idx]
-    
-        # reset any early‑stop counters if you like
+
+        # reset any early‑stop counters
         self.best_w = -float("inf")
         self.no_imp = 0
         self.w_ema = None
-    
+
         # Reset metrics
         self.metrics = {
-            'epochs': [],
-            'w_distance': [],
-            'd_loss': [],
-            'g_loss': [],
-            'n_critic': [],
-            'lr_d': [],
-            'lr_g': [],
-            'val_wd': { c: [] for c in (self.num_cols + self.dt_cols) },
+            "epochs": [],
+            "w_distance": [],
+            "d_loss": [],
+            "g_loss": [],
+            "n_critic": [],
+            "lr_d": [],
+            "lr_g": [],
+            "val_wd": {c: [] for c in (self.num_cols + self.dt_cols)},
         }
-    
-        # ── 1) the usual GAN training loop ────────────────────────────────────
+
+        # the usual GAN training loop
         for epoch in range(1, self.cfg.epochs + 1):
             d_sum = g_sum = w_sum = 0.0
-    
+
             for i, (real_batch,) in enumerate(self.loader, 1):
                 real_batch = real_batch.to(DEVICE)
                 cond = self._sample_cond(real_batch.size(0)).to(DEVICE)
-    
+
                 # train D
                 w_est, d_loss = self._train_d(real_batch, cond)
                 w_sum += w_est
                 d_sum += d_loss
-    
+
                 # train G every n_critic steps
                 if i % self.n_critic == 0:
                     g_loss = self._train_g(real_batch, cond, epoch)
                     g_sum += g_loss.item()
-    
-            # adapt n_critic, decay LRs, EMA‑stop as before…
+
+            # adapt n_critic, decay LRs, EMA‑stop
             mean_W = w_sum / len(self.loader)
             self._adjust_n_critic(mean_W)
             self.sch_g.step()
             self.sch_d.step()
-    
+
             d_mean = d_sum / len(self.loader)
             g_mean = g_sum / max(1, len(self.loader) / self.n_critic)
             lr_d = self.opt_d.param_groups[0]["lr"]
             lr_g = self.opt_g.param_groups[0]["lr"]
-    
+
             # Store metrics
-            self.metrics['epochs'].append(epoch)
-            self.metrics['w_distance'].append(mean_W)
-            self.metrics['d_loss'].append(d_mean)
-            self.metrics['g_loss'].append(g_mean)
-            self.metrics['n_critic'].append(self.n_critic)
-            self.metrics['lr_d'].append(lr_d)
-            self.metrics['lr_g'].append(lr_g)
-    
+            self.metrics["epochs"].append(epoch)
+            self.metrics["w_distance"].append(mean_W)
+            self.metrics["d_loss"].append(d_mean)
+            self.metrics["g_loss"].append(g_mean)
+            self.metrics["n_critic"].append(self.n_critic)
+            self.metrics["lr_d"].append(lr_d)
+            self.metrics["lr_g"].append(lr_g)
+
             if verbose:
                 LOGGER.info(
                     "Ep %03d | W %.4f | D %.4f | G %.4f | n_c %d | lr_d %.6f | lr_g %.6f",
-                    epoch, mean_W, d_mean, g_mean, self.n_critic, lr_d, lr_g
+                    epoch,
+                    mean_W,
+                    d_mean,
+                    g_mean,
+                    self.n_critic,
+                    lr_d,
+                    lr_g,
                 )
-    
+
             if hasattr(self, "val_df") and epoch % self.cfg.val_interval == 0:
                 syn = self.generate(len(self.val_df))
                 val_wd_epoch = {}
-                
+
                 # numeric features
                 for c in self.num_cols:
                     real_vals = self.val_df[c].astype(float).values
                     syn_vals = syn[c].astype(float).values
                     wd = wasserstein_distance(real_vals, syn_vals)
                     val_wd_epoch[c] = wd
-                    self.metrics['val_wd'][c].append((epoch, wd))
+                    self.metrics["val_wd"][c].append((epoch, wd))
                     if verbose:
                         LOGGER.info(f"VAL WD (num) {c:30s}: {wd:.4f}")
-                
-                # datetime features → epoch seconds
+
+                # datetime features to epoch seconds
                 for c in self.dt_cols:
                     real_ts = (
-                            pd.to_datetime(self.val_df[c], format=self.meta[c].datetime_format)
-                            .astype("int64") // 10 ** 9
+                        pd.to_datetime(
+                            self.val_df[c], format=self.meta[c].datetime_format
+                        ).astype("int64")
+                        // 10**9
                     ).values.astype(float)
                     syn_ts = (
-                            pd.to_datetime(syn[c], format=self.meta[c].datetime_format)
-                            .astype("int64") // 10 ** 9
+                        pd.to_datetime(
+                            syn[c], format=self.meta[c].datetime_format
+                        ).astype("int64")
+                        // 10**9
                     ).values.astype(float)
                     wd = wasserstein_distance(real_ts, syn_ts)
                     val_wd_epoch[c] = wd
-                    self.metrics['val_wd'][c].append((epoch, wd))
+                    self.metrics["val_wd"][c].append((epoch, wd))
                     if verbose:
                         LOGGER.info(f"VAL WD (dt)  {c:30s}: {wd:.4f}")
-                
-                # Plot progress if configured
-                # if epoch % self.cfg.plot_interval == 0:
-                #    self.plot_training_metrics()
-    
-            # ── 3) early‐stop on W‐EMA if you like ────────────────────────────────
+
+            # early‐stop on W‐EMA non‐improvement
             w_est = -d_mean
             self.w_ema = w_est if self.w_ema is None else 0.9 * self.w_ema + 0.1 * w_est
             if self.w_ema > self.best_w + 1e-4:
@@ -364,31 +456,38 @@ class GAN:
                 self.best_state = copy.deepcopy(self.G.state_dict())
             else:
                 self.no_imp += 1
-    
+
             if self.no_imp >= self.cfg.patience:
                 if verbose:
-                    LOGGER.info("Early stop after %d epochs without improvement", self.cfg.patience)
+                    LOGGER.info(
+                        "Early stop after %d epochs without improvement",
+                        self.cfg.patience,
+                    )
                 break
-                
+
         # Final visualization after training
         self.plot_training_metrics()
-        
+
         return self.metrics
 
-    # ------------------------------------------------------------------#
     def generate(self, n: int, use_best_model=False, temperature=1.0) -> pd.DataFrame:
-        # Use best model if available and requested
-        if use_best_model and hasattr(self, 'best_state'):
+        """Generate a synthetic data frame of size *n*."""
+        # Use the best model if available and requested
+        orig_state = None
+        if use_best_model and self.best_state is not None:
             orig_state = copy.deepcopy(self.G.state_dict())
             self.G.load_state_dict(self.best_state)
             self.ema_G = copy.deepcopy(self.G)
-        
+
         self.ema_G.eval()
-        rows, bs = [], self.cfg.batch_size
+        rows = []
+        bs = self.cfg.batch_size
 
         if isinstance(temperature, (list, tuple, np.ndarray)):
             temp_vec = torch.tensor(temperature, device=DEVICE).float()
-            assert len(temp_vec) == len(self.num_cols) + len(self.dt_cols), "temperature list length mismatch"
+            assert len(temp_vec) == len(self.num_cols) + len(
+                self.dt_cols
+            ), "temperature list length mismatch"
         else:
             temp_vec = None
 
@@ -396,16 +495,18 @@ class GAN:
             for _ in range(0, n, bs):
                 cur = min(bs, n - len(rows))
                 # Apply temperature to noise distribution
-                z = torch.randn(cur, self.cfg.latent_dim, device=DEVICE) * (temperature if not temp_vec else 1.0)
+                z = torch.randn(cur, self.cfg.latent_dim, device=DEVICE) * (
+                    temperature if not temp_vec else 1.0
+                )
                 cond = self._sample_cond(cur).to(DEVICE)
                 out = self.ema_G(z, cond, hard=True)
                 if temp_vec is not None:
-                    out[:, :len(temp_vec)] *= temp_vec
+                    out[:, : len(temp_vec)] *= temp_vec
                 rows.append(out.cpu().numpy())
         mat = np.vstack(rows)[:n]
-        
-        # Restore original model if we switched
-        if use_best_model and hasattr(self, 'best_state') and 'orig_state' in locals():
+
+        # Restore the original model if we switched
+        if use_best_model and self.best_state is not None and orig_state is not None:
             self.G.load_state_dict(orig_state)
             self.ema_G = copy.deepcopy(self.G)
 
@@ -416,7 +517,7 @@ class GAN:
 
             # round to integer or fixed decimals
             m = self.meta[c]
-            if m.data_type is DataType.INTEGER:
+            if m.data_type is DataType.Integer:
                 inv = np.round(inv).astype(int)
             else:
                 inv = np.round(inv, m.decimal_places)
@@ -426,11 +527,13 @@ class GAN:
             data[c] = self.tfs[c].inverse(mat[:, ptr])
             ptr += 1
         for c, k in zip(self.cat_cols, self.cat_sizes):
-            idx = mat[:, ptr:ptr + k].argmax(1); ptr += k
+            idx = mat[:, ptr : ptr + k].argmax(1)
+            ptr += k
             inv = {v: k for k, v in self.cat_maps[c].items()}
             data[c] = [inv[int(i)] for i in idx]
         for c in self.str_cols:
-            meta = self.meta[c]; fn: Callable = meta.faker_method or self.faker.word
+            meta = self.meta[c]
+            fn: Callable = meta.faker_method or self.faker.word
             data[c] = [fn(**(meta.faker_args or {})) for _ in range(n)]
 
         df = pd.DataFrame(data)
@@ -447,12 +550,15 @@ class GAN:
             w_est = d_real.mean() - d_fake.mean()
 
             if self.cfg.use_hinge:
-                loss = F.relu(1.0 - d_real).mean() + F.relu(1.0 + d_fake).mean()
+                loss = (
+                    functional.relu(1.0 - d_real).mean()
+                    + functional.relu(1.0 + d_fake).mean()
+                )
             else:
                 gp = self._gp(real, fake, cond)
                 loss = -w_est + self.cfg.gp_weight * gp
                 loss = loss + self.cfg.drift_epsilon * (
-                        d_real.pow(2).mean() + d_fake.pow(2).mean()
+                    d_real.pow(2).mean() + d_fake.pow(2).mean()
                 )
 
         self.scaler_d.scale(loss).backward()
@@ -473,7 +579,7 @@ class GAN:
                 fake_cont = fake[:, : (len(self.num_cols) + len(self.dt_cols))]
                 delta_fake = fake_cont[1:] - fake_cont[:-1]
                 # EM distance between distributions (one-sample approx.)
-                loss_delta = F.mse_loss(
+                loss_delta = functional.mse_loss(
                     delta_fake.mean(0), self.delta_real.mean(0)
                 )
                 current_w = self.cfg.delta_w * min(1, epoch / self.cfg.delta_warmup)
@@ -485,7 +591,7 @@ class GAN:
                 #  ── feature‐matching
                 fr = self.D.feature_map(real, cond)
                 ff = self.D.feature_map(fake, cond)
-                fm = F.mse_loss(ff.mean(0), fr.mean(0))
+                fm = functional.mse_loss(ff.mean(0), fr.mean(0))
                 loss = loss + self.cfg.fm_w * fm
 
             if self.cfg.use_cov_loss:
@@ -502,7 +608,7 @@ class GAN:
                 cov_r = (r_centered.T @ r_centered) / (cont_real.size(0) - 1)
 
                 # detach real‐cov so gradient flows only through cov_f
-                cov_loss = F.mse_loss(cov_f, cov_r.detach())
+                cov_loss = functional.mse_loss(cov_f, cov_r.detach())
                 loss += self.cfg.cov_w * cov_loss
         self.scaler_g.scale(loss).backward()
         self.scaler_g.step(self.opt_g)
@@ -538,67 +644,85 @@ class GAN:
         grad = torch.autograd.grad(score.sum(), mix, create_graph=True)[0]
         return ((grad.view(grad.size(0), -1).norm(2, 1) - 1) ** 2).mean()
 
-    def _adjust_n_critic(self, mean_W: float):
+    def _adjust_n_critic(self, mean_w: float):
         """Update self.W_smooth and adapt self.n_critic via three‑level hysteresis."""
         alpha = 0.9
         # update smoothed W
-        self.W_smooth = mean_W if self.W_smooth is None else alpha * self.W_smooth + (1 - alpha) * mean_W
+        self.W_smooth = (
+            mean_w
+            if self.W_smooth is None
+            else alpha * self.W_smooth + (1 - alpha) * mean_w
+        )
 
-        # hysteresis bounds: increase up to initial n_critic, decrease down to 1
+        # hysteresis bounds: increase up to the initial n_critic, decrease down to 1
         if self.W_smooth < 0.015 and self.n_critic < self.cfg.n_critic_initial:
             self.n_critic += 1
         elif self.W_smooth > 0.04 and self.n_critic > 1:
             self.n_critic -= 1
 
-
-
     def plot_training_metrics(self, figsize=(15, 10)):
         """
         Plot training metrics including Wasserstein distance, losses, and other training parameters.
         """
-        if not self.metrics['epochs']:
+        if not self.metrics["epochs"]:
             LOGGER.warning("No training metrics available to plot")
             return
-            
+
         plt.figure(figsize=figsize)
-        
+
         # Create a 2x2 subplot layout
         plt.subplot(2, 2, 1)
-        plt.plot(self.metrics['epochs'], self.metrics['w_distance'], 'b-', label='Wasserstein Distance')
-        plt.title('Wasserstein Distance')
-        plt.xlabel('Epoch')
-        plt.ylabel('W-Distance')
+        plt.plot(
+            self.metrics["epochs"],
+            self.metrics["w_distance"],
+            "b-",
+            label="Wasserstein Distance",
+        )
+        plt.title("Wasserstein Distance")
+        plt.xlabel("Epoch")
+        plt.ylabel("W-Distance")
         plt.grid(True, alpha=0.3)
         plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
-        
+
         plt.subplot(2, 2, 2)
-        plt.plot(self.metrics['epochs'], self.metrics['d_loss'], 'r-', label='Discriminator Loss')
-        plt.plot(self.metrics['epochs'], self.metrics['g_loss'], 'g-', label='Generator Loss')
-        plt.title('Training Losses')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
+        plt.plot(
+            self.metrics["epochs"],
+            self.metrics["d_loss"],
+            "r-",
+            label="Discriminator Loss",
+        )
+        plt.plot(
+            self.metrics["epochs"], self.metrics["g_loss"], "g-", label="Generator Loss"
+        )
+        plt.title("Training Losses")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
-        
+
         plt.subplot(2, 2, 3)
-        plt.plot(self.metrics['epochs'], self.metrics['n_critic'], 'k-')
-        plt.title('n_critic Adaptation')
-        plt.xlabel('Epoch')
-        plt.ylabel('n_critic')
+        plt.plot(self.metrics["epochs"], self.metrics["n_critic"], "k-")
+        plt.title("n_critic Adaptation")
+        plt.xlabel("Epoch")
+        plt.ylabel("n_critic")
         plt.grid(True, alpha=0.3)
         plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
-        
+
         plt.subplot(2, 2, 4)
-        plt.plot(self.metrics['epochs'], self.metrics['lr_d'], 'r-', label='D Learning Rate')
-        plt.plot(self.metrics['epochs'], self.metrics['lr_g'], 'g-', label='G Learning Rate')
-        plt.title('Learning Rates')
-        plt.xlabel('Epoch')
-        plt.ylabel('Learning Rate')
+        plt.plot(
+            self.metrics["epochs"], self.metrics["lr_d"], "r-", label="D Learning Rate"
+        )
+        plt.plot(
+            self.metrics["epochs"], self.metrics["lr_g"], "g-", label="G Learning Rate"
+        )
+        plt.title("Learning Rates")
+        plt.xlabel("Epoch")
+        plt.ylabel("Learning Rate")
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
-        
+
         plt.tight_layout()
 
         plt.show()

@@ -5,4 +5,4 @@ from . import vae
 from . import gan
 from . import transformers
 
-__all__ = ['gan', 'vae', 'transformers']
+__all__ = ["gan", "vae", "transformers"]

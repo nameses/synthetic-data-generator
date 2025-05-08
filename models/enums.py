@@ -2,9 +2,9 @@ from enum import Enum
 
 
 class DataType(Enum):
-    INTEGER = "int"
-    DECIMAL = "decimal"
-    STRING = "string"
-    BOOLEAN = "boolean"
-    CATEGORICAL = "categorical"
-    DATETIME = "datetime"
+    Integer = "int"
+    Decimal = "decimal"
+    String = "string"
+    Boolean = "boolean"
+    Categorical = "categorical"
+    Datetime = "datetime"
