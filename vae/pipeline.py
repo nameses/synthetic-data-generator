@@ -71,11 +71,26 @@ class VAE:
             num_dim=len(self.schema.num_cols + self.schema.dt_cols),
             cat_dims=None,
             real_corr=None,
+            cat_targets=[],
         )
 
         self.training_data.cat_dims = [
             len(self.training_data.cat_maps[c]) for c in self.schema.cat_cols
         ]
+
+        # pre-compute corpus probabilities for every categorical
+        for c in self.schema.cat_cols:
+            # align counts with the fixed category order in cat_maps
+            counts = (
+                self.schema.real_df[c]
+                .value_counts(sort=False)
+                .reindex(self.training_data.cat_maps[c], fill_value=0)
+                .values
+            )
+            probs = torch.tensor(
+                counts / len(self.schema.real_df), dtype=torch.float32, device=DEVICE
+            )
+            self.training_data.cat_targets.append(probs)
 
         real_cont = np.stack(
             [
@@ -103,6 +118,7 @@ class VAE:
                 self.config.model.latent_dim,
             ).to(DEVICE),
             optimizer=None,
+            scheduler=None,
         )
 
         self.models.optimizer = torch.optim.AdamW(
@@ -111,6 +127,19 @@ class VAE:
             ),
             lr=self.config.training.lr,
             weight_decay=self.config.training.weight_decay,
+        )
+
+        self.models.scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.models.optimizer,
+            lambda ep: (
+                (ep + 1) / 10
+                if ep < 10
+                else 0.5
+                * (
+                    1
+                    + math.cos(math.pi * (ep - 10) / (self.config.training.epochs - 10))
+                )
+            ),
         )
 
         self.training_state = TrainingState()
@@ -142,25 +171,19 @@ class VAE:
         return torch.cat([num.to(DEVICE)] + cats, 1)
 
     def _reset_pretrain(self):
+        """Reset training state"""
         self.training_state = TrainingState()
         self.data_pipeline = DataPipeline.from_schema(self.schema, self.config)
 
-    def _calculate_beta(self, epoch: int):
-        return self.config.model.kl_max * max(
-            0,
-            (
-                math.cos(
-                    self.config.model.n_cycles
-                    * math.pi
-                    * epoch
-                    / self.config.training.epochs
-                )
-                + 1
-            )
-            / 2,
-        )
+    def _calculate_beta(self, epoch: int) -> float:
+        """Linear warm-up of the KL weight until `beta_warmup`, then constant."""
+        w = self.config.model.beta_warmup
+        if epoch <= w:
+            return self.config.model.kl_max * epoch / w
+        return self.config.model.kl_max
 
     def _calculate_categorical_loss(self, x, logits):
+        """Calculate categorical loss"""
         if not self.training_data.cat_dims:
             return torch.tensor(0.0, device=DEVICE)
 
@@ -173,11 +196,21 @@ class VAE:
         return loss_cat / len(self.training_data.cat_dims)
 
     def _calculate_correlation_loss(self, synthetic_cont):
+        """Calculate correlation loss"""
         if synthetic_cont.size(1) <= 1:
             return torch.tensor(0.0, device=synthetic_cont.device)
 
         corr_mat = batch_corr(synthetic_cont)
         return functional.l1_loss(corr_mat, self.training_data.real_corr)
+
+    def _calculate_kl_loss(self, logits):
+        """Calculate kl loss"""
+        cat_freq_loss = 0.0
+        for l, target in zip(logits, self.training_data.cat_targets):
+            cat_freq_loss += functional.kl_div(
+                l.softmax(dim=1).mean(0).log(), target, reduction="batchmean"
+            )
+        return cat_freq_loss
 
     def _train_epoch(self, epoch, beg, beta) -> None:
         batch = self.schema.real_df.iloc[
@@ -190,8 +223,8 @@ class VAE:
         num_hat, logits, _ = self.models.decoder(
             z_cat,
             z_num,
-            tau=max(0.5, 1 - epoch / self.config.training.epochs),
-            hard=False,
+            tau=max(0.2, math.exp(-0.005 * epoch)),
+            hard=max(0.2, math.exp(-0.005 * epoch)) <= 0.3,
         )
 
         # numerical loss
@@ -206,13 +239,25 @@ class VAE:
                 "cont"
             ]
         # wasserstain distance
-        loss += 5 * sliced_wasserstein(
+        loss += (5 * beta) * sliced_wasserstein(
             synthetic_cont, x[:, : self.training_data.num_dim]
         )
         # correlation loss
-        loss += 10 * self._calculate_correlation_loss(synthetic_cont)
+        loss += (10 * beta) * self._calculate_correlation_loss(synthetic_cont)
+        # kl loss
+        loss += (2.0 * beta) * self._calculate_kl_loss(logits)
+
         self.models.optimizer.zero_grad()
         loss.backward()
+
+        # gradient clipping
+        torch.nn.utils.clip_grad_norm_(
+            itertools.chain(
+                self.models.encoder.parameters(), self.models.decoder.parameters()
+            ),
+            max_norm=5.0,
+        )
+
         self.models.optimizer.step()
 
     def fit(self) -> None:
@@ -228,6 +273,8 @@ class VAE:
             ):
                 self._train_epoch(epoch, beg, beta)
 
+            self.models.scheduler.step()
+
             # validation, early stop
             if epoch % 5 == 0 or epoch == self.config.training.epochs:
                 val_fake = self.generate(
@@ -239,20 +286,17 @@ class VAE:
                 swd_val = sliced_wasserstein(val_fake, val_real).item()
                 if self.config.training.verbose:
                     LOGGER.info("Ep %03d  β=%0.3f  SWD_val=%0.4f", epoch, beta, swd_val)
-                val_fake = self.generate(
-                    len(self.data_pipeline.validation_df), temperature=0.5, _cpu=False
-                )["cont"]
-                val_real = self._encode(
-                    self.schema.real_df.iloc[self.data_pipeline.validation_df]
-                )[:, : self.training_data.num_dim]
-                swd_val = sliced_wasserstein(val_fake, val_real).item()
+
                 if self.config.training.verbose:
                     # record for final plot
                     self.training_state.history_ep.append(epoch)
                     self.training_state.history_swd.append(swd_val)
                     self.training_state.history_beta.append(beta)
                 if swd_val < self.training_state.best - 1e-4:
-                    self.training_state.best, self.training_state.patience = swd_val, 0
+                    self.training_state.best, self.training_state.no_improvements = (
+                        swd_val,
+                        0,
+                    )
                     torch.save(
                         {
                             "enc": self.models.encoder.state_dict(),

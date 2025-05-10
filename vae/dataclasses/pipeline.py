@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
+from torch.optim.lr_scheduler import LambdaLR
 
 from common import DataSchema
 from .training import VaeConfig
@@ -40,6 +41,7 @@ class ModelContainer:
     encoder: Encoder
     decoder: Decoder
     optimizer: torch.optim.Optimizer
+    scheduler: LambdaLR
 
 
 @dataclass
@@ -52,6 +54,7 @@ class TrainingDataContainer:
     real_corr: torch.Tensor
     num_dim: int
     cat_dims: list[int]
+    cat_targets: list[torch.Tensor]
 
 
 @dataclass

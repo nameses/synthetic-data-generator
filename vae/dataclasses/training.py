@@ -10,6 +10,7 @@ class ModelConfig:
     latent_dim: int = 128
     kl_max: float = 1.0
     n_cycles: int = 4
+    beta_warmup: int = 30
 
 
 @dataclass(slots=True)
