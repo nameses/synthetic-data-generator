@@ -12,7 +12,21 @@ from .dataclasses.pipeline import (
     Optimizers,
     TrainingState,
 )
-from .dataclasses.training import GanConfig, TrainingConfig, SchedulerConfig
+from .dataclasses.training import (
+    GanConfig,
+    TrainingConfig,
+    SchedulerConfig,
+    LossConfig,
+    EmaConfig,
+    FeatureMatchingConfig,
+    RegularizationConfig,
+    DeltaConfig,
+    TemperatureConfig,
+    LossGPConfig,
+    OptimizerConfig,
+    ModelConfig,
+    CovarianceConfig,
+)
 
 __all__ = [
     "GAN",
@@ -30,4 +44,14 @@ __all__ = [
     "GanConfig",
     "TrainingConfig",
     "SchedulerConfig",
+    "LossConfig",
+    "EmaConfig",
+    "FeatureMatchingConfig",
+    "RegularizationConfig",
+    "DeltaConfig",
+    "TemperatureConfig",
+    "LossGPConfig",
+    "OptimizerConfig",
+    "ModelConfig",
+    "CovarianceConfig",
 ]

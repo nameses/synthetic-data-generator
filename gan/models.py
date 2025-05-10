@@ -57,10 +57,10 @@ class _Generator(nn.Module):
         self.num_head = nn.Linear(hid, num_out) if num_out else None
         self.cat_heads = nn.ModuleList(nn.Linear(hid, k) for k in cat_dims)
 
-        if num_out and self.cfg.loss.regularization.use_bias_correction:
-            bias = nn.Parameter(torch.zeros(num_out))
-            scale = nn.Parameter(torch.ones(num_out))
-            self.bias_scale = (bias, scale)
+        if num_out and cfg.loss.regularization.use_bias_correction:
+            self.bias_scale = nn.ParameterList(
+                [nn.Parameter(torch.zeros(num_out)), nn.Parameter(torch.ones(num_out))]
+            )
         else:
             self.bias_scale = None
 
@@ -98,9 +98,10 @@ class _Generator(nn.Module):
         # Affine post‑hoc correction for continuous outputs if enabled
         if self.bias_scale is not None:
             bias, scale = self.bias_scale
-            k = self.num_head.out_features  # number of numeric columns
+            k = self.num_head.out_features
             cont = y[:, :k] * scale + bias
-            y = torch.cat([cont, y[:, k:]], 1)
+            y = torch.cat([cont, y[:, k:]], dim=1)
+
         return y
 
 

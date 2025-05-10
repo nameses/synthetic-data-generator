@@ -223,14 +223,14 @@ class VAE:
         num_hat, logits, _ = self.models.decoder(
             z_cat,
             z_num,
-            tau=max(0.2, math.exp(-0.005 * epoch)),
-            hard=max(0.2, math.exp(-0.005 * epoch)) <= 0.3,
+            tau=max(0.2, math.exp(-0.01 * epoch)),
+            hard=max(0.2, math.exp(-0.01 * epoch)) <= 0.3,
         )
 
         # numerical loss
         loss = functional.mse_loss(num_hat, x[:, : self.training_data.num_dim])
         # categorical loss
-        loss += self._calculate_categorical_loss(x, logits)
+        loss += 2 * self._calculate_categorical_loss(x, logits)
 
         loss += beta * (-0.5 * (1 + logv - mu.pow(2) - logv.exp()).mean())
 

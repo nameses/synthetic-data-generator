@@ -8,7 +8,7 @@ class ModelConfig:
     """VAE architecture / latent‐space settings."""
 
     latent_dim: int = 128
-    kl_max: float = 1.0
+    kl_max: float = 0.5
     n_cycles: int = 4
     beta_warmup: int = 30
 
