@@ -4,13 +4,7 @@ __pycache__
 wgan_checkpoints/
 reports/
 
-datasets/
-!datasets/airline-passenger-satisfaction.csv
-!datasets/healthcare_dataset.csv
-!datasets/household_power_consumption.csv
-!datasets/adult.csv
-
-additional-neural-networks/*.csv
-
 checkpoints/
 .ipynb_checkpoints
+
+datasets/household_power_consumption.csv
